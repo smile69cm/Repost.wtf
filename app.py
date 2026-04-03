@@ -26,22 +26,29 @@ NEON_DB_URL = os.getenv("NEON_DB_URL", "postgresql://neondb_owner:npg_Rh0xIbmdFe
 #  NEON DB INITIALIZATION
 # ---------------------------
 def init_neon_db():
-    """Create distributed queue table with UNIQUE constraint to prevent cross-server duplicates."""
+    """Create distributed queue table and seamlessly upgrade old DB structure."""
     try:
         conn = psycopg2.connect(NEON_DB_URL)
         with conn.cursor() as cur:
+            # 1. Create table if it doesn't exist at all
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS repost_queue (
                     id SERIAL PRIMARY KEY,
                     video_id TEXT UNIQUE NOT NULL,
-                    force_upload BOOLEAN DEFAULT FALSE,
+                    size_limit INT DEFAULT 10,
                     status TEXT DEFAULT 'not started',
                     error TEXT,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
-                CREATE INDEX IF NOT EXISTS idx_status ON repost_queue(status);
             """)
+            # 2. Upgrade old databases (adds size_limit column if missing)
+            try:
+                cur.execute("ALTER TABLE repost_queue ADD COLUMN IF NOT EXISTS size_limit INT DEFAULT 10;")
+            except psycopg2.Error:
+                conn.rollback() # Rollback if column already exists so we can continue
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON repost_queue(status);")
             conn.commit()
         conn.close()
     except Exception as e:
@@ -102,16 +109,16 @@ threading.Thread(target=update_db_count_loop, daemon=True).start()
 # ---------------------------
 #  CENTRAL QUEUE FUNCTIONS
 # ---------------------------
-def add_to_neon_queue(video_id, force=False):
-    """Adds to DB. Ignores if video_id already exists (prevents duplicates)."""
+def add_to_neon_queue(video_id, size_limit=10):
+    """Adds to DB. Ignores if video_id already exists."""
     try:
         conn = psycopg2.connect(NEON_DB_URL)
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO repost_queue (video_id, force_upload, status, updated_at) 
+                INSERT INTO repost_queue (video_id, size_limit, status, updated_at) 
                 VALUES (%s, %s, 'not started', NOW())
                 ON CONFLICT (video_id) DO NOTHING;
-            """, (video_id, force))
+            """, (video_id, size_limit))
             inserted = cur.rowcount > 0
             conn.commit()
         conn.close()
@@ -121,10 +128,7 @@ def add_to_neon_queue(video_id, force=False):
         return False
 
 def get_next_job():
-    """
-    Fetches 'not started' jobs OR jobs stuck in 'doing' for > 5 minutes.
-    Uses SKIP LOCKED so multiple Render servers don't grab the same video.
-    """
+    """Fetches jobs and locks them so servers don't overlap."""
     try:
         conn = psycopg2.connect(NEON_DB_URL)
         with conn.cursor() as cur:
@@ -139,12 +143,12 @@ def get_next_job():
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
-                RETURNING id, video_id, force_upload;
+                RETURNING id, video_id, size_limit;
             """)
             job = cur.fetchone()
             conn.commit()
         conn.close()
-        if job: return {"id": job[0], "video_id": job[1], "force": job[2]}
+        if job: return {"id": job[0], "video_id": job[1], "size_limit": job[2]}
     except: pass
     return None
 
@@ -254,13 +258,12 @@ def reposter_worker():
     while True:
         job = get_next_job()
         
-        # If no jobs or all jobs are "completed", sleep to save Render resources
         if not job:
             current_status["reposter"] = "Idle (Sleeping)"
-            time.sleep(30) # Check DB every 30 seconds
+            time.sleep(30)
             continue
 
-        video_id, force = job["video_id"], job["force"]
+        video_id, size_limit = job["video_id"], job["size_limit"]
         current_status["reposter"] = f"Processing: {video_id[:8]}"
         current_status["queue_size"] = get_queue_size()
 
@@ -284,31 +287,44 @@ def reposter_worker():
                 if r_size.status_code == 200 and 'content-length' in r_size.headers:
                     size_mb = round(int(r_size.headers['content-length']) / (1024 * 1024), 2)
 
-            if size_mb > 10 and not force:
-                emit_log(f"⏭️ SKIPPED ➔ Size: {size_mb}MB > 10MB", "REPOST", "#f43f5e")
+            # --- DYNAMIC SIZE LIMIT LOGIC ---
+            # If the size exceeds the chosen limit (and limit is not 9999 for unlimited)
+            if size_limit != 9999 and size_mb > size_limit:
+                emit_log(f"⏭️ SKIPPED ➔ Size: {size_mb}MB > {size_limit}MB Limit", "REPOST", "#f43f5e")
                 update_job_status(job["id"], 'completed', f"Skipped: Size {size_mb}MB")
                 continue
 
             emit_log(f"📥 DOWNLOADING ➔ {title[:20]} | {size_mb}MB", "REPOST", "#0ea5e9")
             safe_label = re.sub(r'[^a-zA-Z0-9]', '_', video_id)[-12:]
-            raw_file, watermarked_file = f"raw_{safe_label}.mp4", os.path.join(VIDEO_DIR, f"video_{safe_label}.mp4")
+            raw_file = f"raw_{safe_label}.mp4"
+            watermarked_file = os.path.join(VIDEO_DIR, f"video_{safe_label}.mp4")
 
-            # Download
+            # Download Raw File
             with requests.get(d_url, headers=h_media, stream=True) as s_res:
                 if s_res.status_code != 200: raise Exception(f"404 Not Found")
                 with open(raw_file, 'wb') as f:
                     for chunk in s_res.iter_content(8192): f.write(chunk)
 
-            # Watermark
-            emit_log(f"🎨 WATERMARKING...", "REPOST", "#d946ef")
-            vf = "scale='min(720,iw)':-2,drawtext=text='telugu stuffs':fontcolor=yellow@0.6:fontsize=24:x=(w-text_w)/2:y=h-th-14"
-            subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-ss', '1', '-vframes', '1', os.path.join(PREVIEW_DIR, f"{safe_label}.jpg")], capture_output=True)
-            subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
+            # --- SMART WATERMARKING LOGIC ---
+            file_to_upload = raw_file
+            
+            # If Unlimited mode is active AND file is > 40MB, skip FFmpeg to save RAM
+            if size_limit == 9999 and size_mb > 40:
+                emit_log(f"⚡ UNLIMITED PASS ➔ {size_mb}MB. Skipping watermark to prevent RAM crash!", "REPOST", "#d946ef")
+                # We still need a thumbnail preview, this is RAM-safe
+                subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', os.path.join(PREVIEW_DIR, f"{safe_label}.jpg")], capture_output=True)
+                file_to_upload = raw_file
+            else:
+                emit_log(f"🎨 WATERMARKING...", "REPOST", "#d946ef")
+                vf = "scale='min(720,iw)':-2,drawtext=text='telugu stuffs':fontcolor=yellow@0.6:fontsize=24:x=(w-text_w)/2:y=h-th-14"
+                subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-ss', '1', '-vframes', '1', os.path.join(PREVIEW_DIR, f"{safe_label}.jpg")], capture_output=True)
+                subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
+                file_to_upload = watermarked_file
 
             # Upload
             emit_log(f"📤 UPLOADING...", "REPOST", "#0ea5e9")
             base = ".".join(conf['main_domain'].split('.')[-2:])
-            with open(watermarked_file, 'rb') as f:
+            with open(file_to_upload, 'rb') as f:
                 up = requests.post(f"https://{conf['upload_domain']}/upload",
                     files={'files': (f"video_{safe_label}.mp4", f, 'video/mp4')},
                     data={"tag": "18+", "title": title, "description": get_random_desc(), "country": "IN", "username": conf['my_user'], "start": "0", "end": "0"},
@@ -322,11 +338,10 @@ def reposter_worker():
 
         except Exception as e:
             emit_log(f"🔥 Error: {e}", "REPOST", "#ef4444")
-            # If it fails, revert to 'not started' so another server can try it later
             update_job_status(job["id"], 'not started', str(e))
 
         finally:
-            # CRITICAL: Delete both raw and watermarked files to save Render disk space
+            # File Cleanup
             if raw_file and os.path.exists(raw_file): os.remove(raw_file)
             if watermarked_file and os.path.exists(watermarked_file): os.remove(watermarked_file)
 
@@ -370,20 +385,29 @@ HTML_TEMPLATE = """
                 <h3>🔍 Fast DB Scraper</h3>
                 <button onclick="fastSync()" class="btn-sync" style="width:auto; padding:6px 12px; margin:0; font-size:12px;">⚡ FORCE DB SYNC</button>
             </div>
-            <select id="db_mode"><option value="keyword">Keyword</option><option value="username">Username</option></select>
+            <p style="font-size:12px; color:#94a3b8;">Scrapes directly into Database with 0 views/likes, then fetches all titles.</p>
+            <select id="db_mode"><option value="keyword">Keyword (Search)</option><option value="username">Username (Profile)</option></select>
             <input id="db_target" placeholder="Target keyword or username...">
             <button onclick="startScraper()">🚀 EXTRACT TO SUPABASE</button>
         </div>
         <div class="card" style="border-top-color: #f59e0b;">
-            <h3>🎥 Add to Hive Queue</h3>
-            <p style="font-size:12px; color:#94a3b8;">Items added here are stored in Neon DB and shared across all active Render servers.</p>
+            <h3>🎥 Smart Auto-Reposter</h3>
+            <p style="font-size:12px; color:#94a3b8;">Supports: raw video ID, keyword, or username.</p>
             <div style="display:flex; gap:10px;">
                 <select id="rep_mode" style="width:40%;"><option value="manual">Manual IDs</option><option value="keyword">Keyword</option><option value="username">Username</option></select>
                 <input id="rep_input" placeholder="e.g. CAeAPfjrSB2J..." style="width:60%;">
             </div>
-            <label style="display:flex; align-items:center; gap:10px; font-size:13px; margin-top:10px; cursor:pointer; background:#334155; padding:10px; border-radius:4px;">
-                <input type="checkbox" id="force_upload" style="width:auto; margin:0;"> <b style="color:#f43f5e;">FORCE UPLOAD</b>
+            
+            <label style="display:flex; align-items:center; gap:10px; font-size:14px; margin-top:10px; background:#334155; padding:10px; border-radius:4px;">
+                <b style="color:#f8fafc;">SIZE LIMIT:</b>
+                <select id="size_limit" style="width:100%; margin:0; padding:8px;">
+                    <option value="10">Max 10 MB (Safest)</option>
+                    <option value="30">Max 30 MB</option>
+                    <option value="40">Max 40 MB</option>
+                    <option value="9999">Unlimited (Direct upload if >40MB)</option>
+                </select>
             </label>
+            
             <button onclick="startReposter()" class="btn-repost">⚙️ BROADCAST TO NEON DB</button>
         </div>
     </div>
@@ -393,8 +417,8 @@ HTML_TEMPLATE = """
             <button onclick="saveConfig()" style="width:auto; padding:5px 15px; font-size:12px; background:#475569;">💾 SAVE CONFIG</button>
         </div>
         <div class="grid-2" style="margin-bottom:10px;">
-            <input id="set_token" placeholder="Access Token">
-            <input id="set_user" placeholder="Target Username">
+            <input id="set_token" placeholder="Access Token (Required)">
+            <input id="set_user" placeholder="Target Upload Username">
         </div>
         <div id="logs">Loading logs...</div>
     </div>
@@ -407,15 +431,17 @@ HTML_TEMPLATE = """
     }
     async function fastSync() { await fetch('/api/fast_sync', {method: 'POST'}); }
     async function startReposter() {
-        let mode = document.getElementById('rep_mode').value, input = document.getElementById('rep_input').value, force = document.getElementById('force_upload').checked;
-        if(!input) return alert("Enter target!");
-        await fetch('/api/repost', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:mode, input:input, force:force})});
+        let mode = document.getElementById('rep_mode').value;
+        let input = document.getElementById('rep_input').value;
+        let limit = document.getElementById('size_limit').value;
+        if(!input) return alert("Enter target or IDs!");
+        await fetch('/api/repost', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:mode, input:input, size_limit: parseInt(limit)})});
         document.getElementById('rep_input').value = '';
     }
     async function saveConfig() {
         let payload = {my_token: document.getElementById('set_token').value, my_user: document.getElementById('set_user').value};
         await fetch('/api/settings', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-        alert("Saved!");
+        alert("Configuration saved!");
     }
     setInterval(async () => {
         let r = await fetch('/api/status'); let d = await r.json();
@@ -436,7 +462,6 @@ HTML_TEMPLATE = """
 @app.route('/')
 def home(): return render_template_string(HTML_TEMPLATE)
 
-# UPTIMEROBOT HEALTH CHECK URL
 @app.route('/health')
 def health(): return jsonify({"status": "ok", "message": "Render instance awake and tracking Neon DB."}), 200
 
@@ -467,7 +492,7 @@ def api_fast_sync():
 @app.route('/api/repost', methods=['POST'])
 def api_repost():
     data = request.json
-    mode, input_val, force = data['mode'], data['input'], data['force']
+    mode, input_val, size_limit = data['mode'], data['input'], data['size_limit']
 
     def handle_queueing():
         ids = []
@@ -484,8 +509,9 @@ def api_repost():
             ids = loop.run_until_complete(async_db_pipeline(mode, input_val, scrape_only=True))
             loop.close()
 
-        added = sum(1 for vid in ids if add_to_neon_queue(vid, force))
-        emit_log(f"⚡ Added {added} NEW unique jobs to Neon DB (Ignored {len(ids)-added} duplicates).", "REPOST", "#f59e0b")
+        added = sum(1 for vid in ids if add_to_neon_queue(vid, size_limit))
+        limit_text = "Unlimited" if size_limit == 9999 else f"{size_limit}MB"
+        emit_log(f"⚡ Added {added} NEW unique jobs (Limit: {limit_text})", "REPOST", "#f59e0b")
 
     threading.Thread(target=handle_queueing, daemon=True).start()
     return jsonify({"status": "queued"})
