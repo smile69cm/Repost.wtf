@@ -5,26 +5,25 @@ from functools import wraps
 from datetime import datetime, timezone, timedelta
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import execute_values
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'changeme_production_secret_!@#$')
 
 # ---------------------------
-#  INDIAN TIMEZONE (IST) with 12‑hour format
+#  INDIAN TIMEZONE (IST) - 12 hour format
 # ---------------------------
 IST = timezone(timedelta(hours=5, minutes=30))
 def ist_now(): return datetime.now(IST)
 def ist_time_str(): return ist_now().strftime("%I:%M:%S %p")  # 12-hour with AM/PM
 
 # ---------------------------
-#  SERVER IDENTIFICATION (unique per instance)
+#  SERVER ID
 # ---------------------------
 SERVER_ID = os.environ.get('SERVER_ID', socket.gethostname() + "_" + str(uuid.uuid4())[:8])
 print(f"🖥️ Server ID: {SERVER_ID}")
 
 # ---------------------------
-#  ENVIRONMENT VARIABLES (with fallbacks)
+#  ENVIRONMENT VARIABLES
 # ---------------------------
 NEON_DB_URL = os.environ.get('NEON_DB_URL', "postgresql://neondb_owner:npg_Rh0xIbmdFe5u@ep-quiet-block-a12aatzr-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
 SUPABASE_URL = os.environ.get('SUPABASE_URL', "https://cnkbewgpguyojiebztbs.supabase.co/rest/v1/reels")
@@ -33,14 +32,13 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 FFMPEG_PATH = os.environ.get('FFMPEG_PATH', 'ffmpeg')
 
 # ---------------------------
-#  DIRECTORIES & FILES
+#  DIRECTORIES
 # ---------------------------
 BASE_DIR = os.getcwd()
 VIDEO_DIR = os.path.join(BASE_DIR, "watermarked_videos")
 PREVIEW_DIR = os.path.join(BASE_DIR, "previews")
 SETTINGS_FILE = "settings.json"
 STATE_FILE = "state.json"
-LOCK_FILE = "/tmp/swarm.lock"
 
 for d in [VIDEO_DIR, PREVIEW_DIR]:
     if not os.path.exists(d): os.makedirs(d)
@@ -56,7 +54,7 @@ def check_ffmpeg():
 FFMPEG_AVAILABLE = check_ffmpeg()
 
 # ---------------------------
-#  CROSS‑PROCESS STATE (file‑based)
+#  CROSS‑PROCESS STATE
 # ---------------------------
 def read_state():
     try:
@@ -65,25 +63,21 @@ def read_state():
             data = json.load(f)
             fcntl.flock(f, fcntl.LOCK_UN)
             return data
-    except (FileNotFoundError, json.JSONDecodeError):
+    except:
         return {"logs": [], "scraper": "Idle", "reposter": "Idle", "queue_size": 0, "cleaner_running": False, "fast_mode": False, "current_operation": None}
-
 def write_state(data):
     with open(STATE_FILE, 'w') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(data, f, indent=2)
         fcntl.flock(f, fcntl.LOCK_UN)
-
 def emit_log(msg, category="SYS", color="#10b981", is_error=False):
     t = ist_time_str()
-    full_msg = f"[{t}] [{category}] {msg}"
-    print(full_msg)
+    print(f"[{t}] [{category}] {msg}")
     if is_error: print(traceback.format_exc())
     state = read_state()
     state["logs"].append({"time": t, "category": category, "message": msg, "color": color, "is_error": is_error})
     if len(state["logs"]) > 200: state["logs"] = state["logs"][-200:]
     write_state(state)
-
 def update_status(scraper=None, reposter=None, queue_size=None, current_op=None):
     state = read_state()
     if scraper is not None: state["scraper"] = scraper
@@ -106,7 +100,6 @@ def init_db_pool():
         print("✅ DB pool ready")
     except Exception as e: print(f"❌ DB pool error: {e}")
 init_db_pool()
-
 def get_db_connection():
     return db_pool.getconn() if db_pool else psycopg2.connect(NEON_DB_URL)
 def return_db_connection(conn):
@@ -114,7 +107,34 @@ def return_db_connection(conn):
     else: conn.close()
 
 # ---------------------------
-#  DATABASE TABLES (with source tracking)
+#  FIX: ALTER fast_mode COLUMN TO BOOLEAN
+# ---------------------------
+def fix_fast_mode_column():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Check column type
+            cur.execute("""
+                SELECT data_type FROM information_schema.columns 
+                WHERE table_name='repost_queue' AND column_name='fast_mode';
+            """)
+            row = cur.fetchone()
+            if row and row[0] != 'boolean':
+                # Convert text to boolean: 'true'/'false' or 1/0
+                cur.execute("ALTER TABLE repost_queue ALTER COLUMN fast_mode TYPE BOOLEAN USING (fast_mode::boolean);")
+                conn.commit()
+                emit_log("Fixed fast_mode column type to BOOLEAN", "DB", "#10b981")
+            elif not row:
+                cur.execute("ALTER TABLE repost_queue ADD COLUMN fast_mode BOOLEAN DEFAULT FALSE;")
+                conn.commit()
+    except Exception as e:
+        emit_log(f"fast_mode fix error: {e}", "DB", "#ef4444", True)
+    finally:
+        return_db_connection(conn)
+fix_fast_mode_column()
+
+# ---------------------------
+#  DATABASE TABLES
 # ---------------------------
 def init_neon_db():
     conn = get_db_connection()
@@ -135,10 +155,10 @@ def init_neon_db():
                     fast_mode BOOLEAN DEFAULT FALSE
                 );
             """)
-            # Add missing columns if not exist
-            for col in ['server_id', 'source_type', 'source_value', 'fast_mode']:
+            # Add missing columns if any
+            for col, dtype in [('server_id','TEXT'), ('source_type','TEXT'), ('source_value','TEXT')]:
                 try:
-                    cur.execute(f"ALTER TABLE repost_queue ADD COLUMN IF NOT EXISTS {col} TEXT;")
+                    cur.execute(f"ALTER TABLE repost_queue ADD COLUMN IF NOT EXISTS {col} {dtype};")
                 except: pass
             cur.execute("CREATE TABLE IF NOT EXISTS image_hashes (vid TEXT PRIMARY KEY, hash TEXT);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON repost_queue(status);")
@@ -176,7 +196,7 @@ def get_headers():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 # ---------------------------
-#  AUTH DECORATOR
+#  AUTH
 # ---------------------------
 def login_required(f):
     @wraps(f)
@@ -184,7 +204,6 @@ def login_required(f):
         if not session.get('logged_in'): return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -193,14 +212,13 @@ def login():
             return redirect(url_for('home'))
         return render_template_string(LOGIN_TEMPLATE, error="Invalid password")
     return render_template_string(LOGIN_TEMPLATE, error=None)
-
 @app.route('/logout')
 def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
 
 # ---------------------------
-#  QUEUE HELPERS (with source tracking)
+#  QUEUE HELPERS
 # ---------------------------
 def add_to_neon_queue(video_id, size_limit, source_type, source_value, fast=False):
     conn = get_db_connection()
@@ -221,11 +239,10 @@ def add_to_neon_queue(video_id, size_limit, source_type, source_value, fast=Fals
         return_db_connection(conn)
 
 def get_next_job():
-    """Fetch next job: fast mode first, then normal, using SKIP LOCKED."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # First try fast mode jobs
+            # Fast mode first (now boolean works)
             cur.execute("""
                 UPDATE repost_queue SET status = 'doing', updated_at = NOW()
                 WHERE id = (
@@ -236,7 +253,6 @@ def get_next_job():
             """)
             job = cur.fetchone()
             if not job:
-                # Then normal jobs
                 cur.execute("""
                     UPDATE repost_queue SET status = 'doing', updated_at = NOW()
                     WHERE id = (
@@ -277,25 +293,7 @@ def get_queue_size():
     finally:
         return_db_connection(conn)
 
-def get_queue_sources_summary():
-    """Return summary grouped by server, source_type, source_value."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT server_id, source_type, source_value, COUNT(*) 
-                FROM repost_queue WHERE status = 'not started' 
-                GROUP BY server_id, source_type, source_value 
-                ORDER BY COUNT(*) DESC;
-            """)
-            return cur.fetchall()
-    except:
-        return []
-    finally:
-        return_db_connection(conn)
-
 def get_queue_sources_grouped():
-    """Return nested dict: {source_type: {source_value: count}} for UI display."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -385,7 +383,7 @@ def extract_video_id_from_input(input_str):
     return None
 
 # ---------------------------
-#  SINGLE BACKGROUND OPERATION LOCK
+#  SINGLE OPERATION LOCK
 # ---------------------------
 operation_lock = threading.Lock()
 def run_exclusive(func):
@@ -521,7 +519,7 @@ def process_video_job(job):
             if f and os.path.exists(f): os.remove(f)
 
 # ---------------------------
-#  DATABASE HELPERS (uploaded table)
+#  UPLOADED TABLE HELPERS
 # ---------------------------
 def is_video_already_uploaded(thumbnail_hash):
     if not thumbnail_hash: return False
@@ -532,7 +530,6 @@ def is_video_already_uploaded(thumbnail_hash):
             return cur.fetchone() is not None
     except: return False
     finally: return_db_connection(conn)
-
 def mark_video_uploaded(thumbnail_hash, account_video_id, original_source_id):
     conn = get_db_connection()
     try:
@@ -544,7 +541,7 @@ def mark_video_uploaded(thumbnail_hash, account_video_id, original_source_id):
     finally: return_db_connection(conn)
 
 # ---------------------------
-#  CLEANER & SYNC (with exclusive lock)
+#  CLEANER & SYNC
 # ---------------------------
 @run_exclusive
 def native_cleaner_task():
@@ -681,7 +678,6 @@ def home():
 def api_status():
     state = read_state()
     state["queue_size"] = get_queue_size()
-    state["sources"] = get_queue_sources_summary()
     state["sources_grouped"] = get_queue_sources_grouped()
     return jsonify(state)
 
@@ -785,16 +781,12 @@ def api_sync_uploaded():
     return jsonify({"status": "started"})
 
 # ---------------------------
-#  PROFESSIONAL UI (with source grouping, 12‑hour time)
+#  UI TEMPLATES (Mobile Responsive)
 # ---------------------------
 LOGIN_TEMPLATE = """
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Swarm Login</title><style>
-body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-.login-card{background:rgba(30,41,59,0.9);backdrop-filter:blur(12px);padding:40px;border-radius:24px;width:350px;text-align:center;border:1px solid rgba(255,255,255,0.1);box-shadow:0 20px 35px -10px black}
-h2{color:#f8fafc;margin-bottom:20px}input{width:100%;padding:12px;margin:10px 0;border-radius:12px;border:none;background:#0f172a;color:white}
-button{width:100%;padding:12px;background:#3b82f6;border:none;border-radius:12px;color:white;font-weight:bold;cursor:pointer;transition:0.2s}
-button:hover{background:#2563eb;transform:scale(1.02)}.error{color:#ef4444;margin-top:10px}
-</style></head><body><div class="login-card"><h2>🔐 Swarm Node Access</h2><form method="POST"><input type="password" name="password" placeholder="Enter password" autofocus><button type="submit">Authenticate</button>{% if error %}<div class="error">{{ error }}</div>{% endif %}</form></div></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes"><title>Swarm Login</title><style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}.login-card{background:rgba(30,41,59,0.9);backdrop-filter:blur(12px);padding:32px 24px;border-radius:28px;width:100%;max-width:380px;text-align:center;border:1px solid rgba(255,255,255,0.1);box-shadow:0 20px 35px -10px black}h2{color:#f8fafc;margin-bottom:24px;font-size:1.8rem}input{width:100%;padding:14px;margin:12px 0;border-radius:16px;border:none;background:#0f172a;color:white;font-size:1rem}button{width:100%;padding:14px;background:#3b82f6;border:none;border-radius:40px;color:white;font-weight:600;font-size:1rem;cursor:pointer;transition:0.2s}button:hover{background:#2563eb;transform:scale(0.98)}.error{color:#ef4444;margin-top:12px}
+</style></head><body><div class="login-card"><h2>🔐 Swarm Node</h2><form method="POST"><input type="password" name="password" placeholder="Enter password" autofocus><button type="submit">Authenticate</button>{% if error %}<div class="error">{{ error }}</div>{% endif %}</form></div></body></html>
 """
 
 HTML_TEMPLATE = """
@@ -802,169 +794,124 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>V13.0 Swarm Node | Advanced</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes, viewport-fit=cover">
+    <title>V14.0 Swarm Node | Mobile Ready</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: #0b1120; color: #f1f5f9; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; flex-wrap: wrap; gap: 15px; }
-        h1 { font-size: 1.8rem; background: linear-gradient(135deg, #60a5fa, #c084fc); -webkit-background-clip: text; background-clip: text; color: transparent; letter-spacing: -0.5px; }
-        .badge { background: #1e293b; padding: 6px 14px; border-radius: 40px; font-size: 0.8rem; font-family: monospace; border: 1px solid #334155; }
-        .logout-btn { background: #ef4444; padding: 8px 20px; border-radius: 40px; text-decoration: none; color: white; font-weight: 500; transition: 0.2s; }
-        .logout-btn:hover { background: #dc2626; transform: scale(0.96); }
-        .status-bar { background: #1e293b; border-radius: 20px; padding: 16px 24px; margin-bottom: 25px; display: flex; gap: 30px; flex-wrap: wrap; border-left: 4px solid #10b981; box-shadow: 0 8px 20px -6px rgba(0,0,0,0.5); }
-        .status-item { display: flex; align-items: baseline; gap: 10px; background: #0f172a; padding: 6px 16px; border-radius: 40px; }
-        .status-label { font-weight: 600; color: #94a3b8; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px; }
-        .status-value { font-weight: 700; font-size: 1rem; }
-        .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 25px; margin-bottom: 25px; }
-        .card { background: #1e293b; border-radius: 24px; padding: 24px; box-shadow: 0 12px 24px -8px rgba(0,0,0,0.4); transition: all 0.25s ease; border-top: 3px solid #3b82f6; }
-        .card:hover { transform: translateY(-3px); box-shadow: 0 20px 30px -12px black; }
-        .card h2 { font-size: 1.4rem; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; }
-        .input-group { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; }
-        .input-group select, .input-group input { flex: 1; padding: 12px 16px; border-radius: 16px; border: 1px solid #334155; background: #0f172a; color: white; font-size: 0.9rem; transition: 0.2s; }
-        .input-group select:focus, .input-group input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.3); }
-        button { background: #3b82f6; padding: 12px 20px; border: none; border-radius: 40px; color: white; font-weight: 600; cursor: pointer; transition: 0.2s; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px; }
-        button:hover { filter: brightness(1.1); transform: scale(0.98); }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1120; color: #f1f5f9; padding: 16px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .header { display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+        h1 { font-size: 1.6rem; background: linear-gradient(135deg, #60a5fa, #c084fc); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .top-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; }
+        .badge { background: #1e293b; padding: 5px 12px; border-radius: 40px; font-size: 0.7rem; font-family: monospace; }
+        .logout-btn { background: #ef4444; padding: 6px 16px; border-radius: 40px; text-decoration: none; color: white; font-size: 0.8rem; font-weight: 500; }
+        .status-bar { background: #1e293b; border-radius: 20px; padding: 12px 16px; margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 12px; border-left: 3px solid #10b981; }
+        .status-item { background: #0f172a; padding: 5px 12px; border-radius: 40px; font-size: 0.75rem; display: flex; align-items: baseline; gap: 6px; }
+        .status-label { color: #94a3b8; text-transform: uppercase; font-size: 0.65rem; }
+        .status-value { font-weight: 700; font-size: 0.85rem; }
+        .card { background: #1e293b; border-radius: 24px; padding: 20px; margin-bottom: 20px; border-top: 3px solid #3b82f6; }
+        .card h2 { font-size: 1.3rem; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+        .input-group { display: flex; flex-direction: column; gap: 12px; margin: 16px 0; }
+        .input-row { display: flex; flex-wrap: wrap; gap: 10px; }
+        .input-row select, .input-row input { flex: 1; padding: 12px; border-radius: 16px; border: 1px solid #334155; background: #0f172a; color: white; font-size: 0.9rem; }
+        button { background: #3b82f6; padding: 12px 18px; border: none; border-radius: 40px; color: white; font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: 0.2s; width: 100%; }
+        button:active { transform: scale(0.97); }
         .btn-purple { background: #8b5cf6; }
         .btn-orange { background: #f59e0b; }
         .btn-red { background: #ef4444; }
         .btn-green { background: #10b981; }
-        .fast-toggle { background: #334155; color: #f1f5f9; border: 1px solid #475569; }
-        .fast-toggle.active { background: #f59e0b; color: #0f172a; border-color: #f59e0b; }
-        hr { border-color: #334155; margin: 20px 0; }
-        .logs-panel { background: #0f172a; border-radius: 24px; padding: 20px; margin-top: 25px; }
-        .logs-header { display: flex; justify-content: space-between; margin-bottom: 15px; align-items: center; flex-wrap: wrap; gap: 10px; }
-        #logs { height: 380px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; background: #020617; padding: 16px; border-radius: 16px; }
-        .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .settings-grid input { width: 100%; padding: 10px 14px; border-radius: 14px; background: #0f172a; border: 1px solid #334155; color: white; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; }
-        .modal-content { background: #1e293b; border-radius: 28px; padding: 28px; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto; box-shadow: 0 25px 40px -12px black; animation: fadeInUp 0.3s ease; }
-        .modal-content h3 { margin-bottom: 16px; font-size: 1.5rem; }
-        .source-group { margin-bottom: 24px; }
-        .source-group h4 { color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; font-size: 0.8rem; letter-spacing: 1px; }
-        .source-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
-        .source-table th, .source-table td { text-align: left; padding: 8px 8px; border-bottom: 1px solid #334155; }
-        .source-table th { color: #cbd5e1; font-weight: 500; }
-        .close-modal { float: right; font-size: 28px; cursor: pointer; background: none; border: none; color: white; padding: 0; line-height: 1; }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .toast { position: fixed; bottom: 20px; right: 20px; background: #1e293b; border-left: 4px solid #10b981; padding: 12px 20px; border-radius: 40px; z-index: 1100; font-size: 14px; backdrop-filter: blur(8px); box-shadow: 0 8px 16px -4px black; }
-        @media (max-width: 680px) { .grid-2 { grid-template-columns: 1fr; } .status-bar { flex-direction: column; gap: 10px; } }
+        .fast-toggle { background: #334155; border: 1px solid #475569; }
+        .fast-toggle.active { background: #f59e0b; color: #0f172a; }
+        hr { border-color: #334155; margin: 16px 0; }
+        .logs-panel { background: #0f172a; border-radius: 20px; padding: 16px; }
+        .logs-header { display: flex; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+        #logs { height: 320px; overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.5; background: #020617; padding: 12px; border-radius: 16px; }
+        .settings-grid { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+        .settings-grid input { padding: 12px; border-radius: 16px; background: #0f172a; border: 1px solid #334155; color: white; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; padding: 16px; }
+        .modal-content { background: #1e293b; border-radius: 28px; padding: 20px; width: 100%; max-width: 500px; max-height: 80vh; overflow-y: auto; }
+        .modal-content h3 { margin-bottom: 16px; font-size: 1.3rem; }
+        .source-group { margin-bottom: 20px; }
+        .source-group h4 { color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; margin-bottom: 8px; }
+        .source-table { width: 100%; border-collapse: collapse; }
+        .source-table td, .source-table th { padding: 8px 6px; text-align: left; border-bottom: 1px solid #334155; font-size: 0.8rem; }
+        .close-modal { float: right; font-size: 28px; cursor: pointer; background: none; border: none; color: white; line-height: 1; }
+        .toast { position: fixed; bottom: 20px; left: 16px; right: 16px; background: #1e293b; border-left: 4px solid #10b981; padding: 12px 16px; border-radius: 40px; z-index: 1100; font-size: 0.8rem; backdrop-filter: blur(8px); text-align: center; }
+        @media (min-width: 768px) { .container { max-width: 800px; } .input-row { flex-direction: row; } .status-bar { flex-wrap: nowrap; } button { width: auto; } .toast { left: auto; right: 20px; max-width: 350px; } }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>🐝 V13.0 ADVANCED SWARM NODE</h1>
-        <div style="display: flex; gap: 12px; align-items: center;">
-            <span class="badge">🖥️ {{ server_id }}</span>
-            <button id="showSourcesBtn" class="fast-toggle" style="background:#334155;">📊 Queue Sources</button>
-            <button id="settingsBtn" class="fast-toggle" style="background:#334155;">⚙️ Settings</button>
-            <a href="/logout" class="logout-btn">🚪 Logout</a>
-        </div>
+        <div class="top-bar"><h1>🐝 V14.0 SWARM NODE</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
+        <div class="badge">🖥️ {{ server_id }}</div>
     </div>
     <div class="status-bar">
-        <div class="status-item"><span class="status-label">SCRAPER</span><span id="s-scrape" class="status-value" style="color:#3b82f6;">Idle</span></div>
-        <div class="status-item"><span class="status-label">WORKER</span><span id="s-repost" class="status-value" style="color:#f59e0b;">Idle</span></div>
-        <div class="status-item"><span class="status-label">QUEUE SIZE</span><span id="s-q" class="status-value" style="color:#10b981;">0</span></div>
-        <div class="status-item"><span class="status-label">FFMPEG</span><span class="status-value" style="color:{{ '#10b981' if ffmpeg_ok else '#ef4444' }};">{{ '✓ Available' if ffmpeg_ok else '✗ Missing' }}</span></div>
-        <div class="status-item"><span class="status-label">CURRENT OP</span><span id="current-op" class="status-value">None</span></div>
+        <div class="status-item"><span class="status-label">SCRAPER</span><span id="s-scrape" style="color:#3b82f6;">Idle</span></div>
+        <div class="status-item"><span class="status-label">WORKER</span><span id="s-repost" style="color:#f59e0b;">Idle</span></div>
+        <div class="status-item"><span class="status-label">QUEUE</span><span id="s-q" style="color:#10b981;">0</span></div>
+        <div class="status-item"><span class="status-label">FFMPEG</span><span style="color:{{ '#10b981' if ffmpeg_ok else '#ef4444' }};">{{ '✓' if ffmpeg_ok else '✗' }}</span></div>
+        <div class="status-item"><span class="status-label">OP</span><span id="current-op">None</span></div>
     </div>
-    <div class="grid-2">
-        <div class="card" style="border-top-color:#8b5cf6;">
-            <h2>📦 SECTION 1: Supabase Archiver</h2>
-            <p style="font-size:0.85rem; color:#94a3b8;">Scrape IDs → store to Supabase (no queue)</p>
-            <div class="input-group">
-                <select id="arch_mode"><option value="keyword">Keyword</option><option value="username">Username</option><option value="single">Single ID/Link</option></select>
-                <input id="arch_target" placeholder="Keyword, username, or link...">
-            </div>
-            <div class="input-group">
-                <button id="archFastBtn" class="fast-toggle">⚡ Fast Mode OFF</button>
-                <button onclick="startSupabaseArchive()" class="btn-purple" style="flex:2">🚀 ARCHIVE TO SUPABASE</button>
-            </div>
+    <div class="card" style="border-top-color:#8b5cf6;">
+        <h2>📦 Archiver</h2>
+        <div class="input-group">
+            <div class="input-row"><select id="arch_mode"><option value="keyword">Keyword</option><option value="username">Username</option><option value="single">Single ID/Link</option></select></div>
+            <input id="arch_target" placeholder="Keyword, username, or link...">
+            <div class="input-row"><button id="archFastBtn" class="fast-toggle">⚡ Fast OFF</button><button onclick="startSupabaseArchive()" class="btn-purple">🚀 Archive</button></div>
         </div>
-        <div class="card" style="border-top-color:#f59e0b;">
-            <h2>🎬 SECTION 2: Worker Queue & Reposter</h2>
-            <p style="font-size:0.85rem; color:#94a3b8;">Scrape → queue → download → watermark → upload</p>
-            <div class="input-group">
-                <select id="rep_mode"><option value="keyword">Keyword</option><option value="username">Username</option><option value="manual">Manual IDs</option></select>
-                <input id="rep_input" placeholder="Keyword, username, or IDs...">
-            </div>
-            <div class="input-group">
-                <select id="size_limit"><option value="20">20 MB</option><option value="30">30 MB</option><option value="40">40 MB</option><option value="9999">No limit</option></select>
-                <button id="repFastBtn" class="fast-toggle">⚡ Fast Mode OFF</button>
-                <button onclick="startReposter()" class="btn-orange" style="flex:2">⚙️ SCRAPE & ADD TO QUEUE</button>
-            </div>
-            <hr>
-            <div class="input-group">
-                <button onclick="runCleaner()" class="btn-red">🧹 DELETE DUPLICATES</button>
-                <button onclick="syncUploadedTable()" class="btn-green">🔄 SYNC UPLOADED TABLE</button>
-            </div>
+    </div>
+    <div class="card" style="border-top-color:#f59e0b;">
+        <h2>🎬 Reposter</h2>
+        <div class="input-group">
+            <div class="input-row"><select id="rep_mode"><option value="keyword">Keyword</option><option value="username">Username</option><option value="manual">Manual IDs</option></select></div>
+            <input id="rep_input" placeholder="Keyword, username, or IDs...">
+            <div class="input-row"><select id="size_limit"><option value="20">20 MB</option><option value="30">30 MB</option><option value="40">40 MB</option><option value="9999">No limit</option></select></div>
+            <div class="input-row"><button id="repFastBtn" class="fast-toggle">⚡ Fast OFF</button><button onclick="startReposter()" class="btn-orange">⚙️ Add to Queue</button></div>
         </div>
+        <hr>
+        <div class="input-row"><button onclick="runCleaner()" class="btn-red">🧹 Delete Duplicates</button><button onclick="syncUploadedTable()" class="btn-green">🔄 Sync Uploaded</button></div>
+        <div class="input-row" style="margin-top:12px"><button id="showSourcesBtn" style="background:#334155;">📊 Show Queue Sources</button><button id="settingsBtn" style="background:#334155;">⚙️ Settings</button></div>
     </div>
     <div class="logs-panel">
-        <div class="logs-header"><h2>📋 Live Logs (IST 12‑hr)</h2><button onclick="clearLogs()" style="background:#475569; padding:6px 16px;">Clear</button></div>
-        <div id="logs">Loading logs...</div>
+        <div class="logs-header"><span>📋 Live Logs (IST 12hr)</span><button onclick="clearLogs()" style="background:#475569; padding:6px 12px; width:auto;">Clear</button></div>
+        <div id="logs">Loading...</div>
     </div>
 </div>
-<!-- Modal for Queue Sources (grouped) -->
 <div id="sourceModal" class="modal"><div class="modal-content"><span class="close-modal">&times;</span><h3>📌 Pending Jobs by Source</h3><div id="sourceTableBody">Loading...</div></div></div>
-<!-- Modal for Settings -->
-<div id="settingsModal" class="modal"><div class="modal-content"><span class="close-modal">&times;</span><h3>⚙️ Node Configuration</h3><div class="settings-grid"><input id="set_token" placeholder="Access Token"><input id="set_user" placeholder="Username"><input id="set_del" placeholder="Delete Payload"><input id="set_bl" placeholder="Blacklist (comma)"></div><input id="set_cookie" placeholder="Full Cookie Header" style="width:100%; margin-bottom:15px;"><button onclick="saveConfig()" style="background:#475569;">💾 Save Overrides</button></div></div>
+<div id="settingsModal" class="modal"><div class="modal-content"><span class="close-modal">&times;</span><h3>⚙️ Configuration</h3><div class="settings-grid"><input id="set_token" placeholder="Access Token"><input id="set_user" placeholder="Username"><input id="set_del" placeholder="Delete Payload"><input id="set_bl" placeholder="Blacklist"></div><input id="set_cookie" placeholder="Full Cookie Header"><button onclick="saveConfig()" style="margin-top:16px; background:#475569;">💾 Save</button></div></div>
 <div id="toast" class="toast" style="display:none;"></div>
 <script>
-    let archFast = false, repFast = false;
-    function showToast(msg, isError=false) { let t=document.getElementById('toast'); t.style.display='block'; t.style.borderLeftColor=isError?'#ef4444':'#10b981'; t.innerHTML=msg; setTimeout(()=>t.style.display='none',3500); }
-    document.getElementById('archFastBtn').onclick=()=>{ archFast=!archFast; document.getElementById('archFastBtn').innerHTML=archFast?'⚡ Fast Mode ON':'⚡ Fast Mode OFF'; document.getElementById('archFastBtn').classList.toggle('active',archFast); };
-    document.getElementById('repFastBtn').onclick=()=>{ repFast=!repFast; document.getElementById('repFastBtn').innerHTML=repFast?'⚡ Fast Mode ON':'⚡ Fast Mode OFF'; document.getElementById('repFastBtn').classList.toggle('active',repFast); };
-    async function startSupabaseArchive() {
-        let mode=document.getElementById('arch_mode').value, target=document.getElementById('arch_target').value.trim();
-        if(!target){ showToast("Enter target!",true); return; }
-        let resp=await fetch('/api/supabase_archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,target:target,fast:archFast})});
-        let data=await resp.json(); showToast(data.message); document.getElementById('arch_target').value='';
-    }
-    async function startReposter() {
-        let mode=document.getElementById('rep_mode').value, input=document.getElementById('rep_input').value.trim(), limit=document.getElementById('size_limit').value;
-        if(!input){ showToast("Enter target or IDs!",true); return; }
-        await fetch('/api/repost',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,input:input,size_limit:parseInt(limit),fast:repFast})});
-        showToast("Scraping and queueing started."); document.getElementById('rep_input').value='';
-    }
-    async function runCleaner(){ if(confirm("Delete duplicate reels?")){ await fetch('/api/cleaner',{method:'POST'}); showToast("Cleaner started."); } }
-    async function syncUploadedTable(){ if(confirm("Sync uploaded table?")){ await fetch('/api/sync_uploaded',{method:'POST'}); showToast("Sync started."); } }
-    async function saveConfig(){ let payload={my_token:document.getElementById('set_token').value,my_user:document.getElementById('set_user').value,blacklist:document.getElementById('set_bl').value,del_payload:document.getElementById('set_del').value,full_cookie:document.getElementById('set_cookie').value};
-        await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); showToast("Settings saved."); }
-    async function clearLogs(){ await fetch('/api/clear_logs',{method:'POST'}); showToast("Logs cleared."); }
-    let sourceModal=document.getElementById('sourceModal'), settingsModal=document.getElementById('settingsModal');
-    document.getElementById('showSourcesBtn').onclick=async()=>{
-        let r=await fetch('/api/status'); let d=await r.json(); let grouped=d.sources_grouped||{};
-        let html='';
-        for(let [type, items] of Object.entries(grouped)){
-            html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source Value</th><th>Count</th></tr>`;
-            items.forEach(item=>{ html+=`<tr><td>${escapeHtml(item.value)}</td><td>${item.count}</td></tr>`; });
-            html+=`</table></div>`;
-        }
-        if(!Object.keys(grouped).length) html='<p>No pending jobs in queue.</p>';
-        document.getElementById('sourceTableBody').innerHTML=html; sourceModal.style.display='flex';
-    };
-    function escapeHtml(str){ return str.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
-    document.getElementById('settingsBtn').onclick=async()=>{ let r=await fetch('/api/settings'); let d=await r.json(); document.getElementById('set_token').value=d.my_token||''; document.getElementById('set_user').value=d.my_user||''; document.getElementById('set_bl').value=d.blacklist||''; document.getElementById('set_del').value=d.del_payload||''; document.getElementById('set_cookie').value=d.full_cookie||''; settingsModal.style.display='flex'; };
-    document.querySelectorAll('.close-modal').forEach(btn=>btn.onclick=()=>{ sourceModal.style.display='none'; settingsModal.style.display='none'; });
-    window.onclick=e=>{ if(e.target==sourceModal) sourceModal.style.display='none'; if(e.target==settingsModal) settingsModal.style.display='none'; };
-    setInterval(async()=>{ try{ let r=await fetch('/api/status'); let d=await r.json(); document.getElementById('s-scrape').innerText=d.scraper; document.getElementById('s-repost').innerText=d.reposter; document.getElementById('s-q').innerText=d.queue_size; document.getElementById('current-op').innerText=d.current_operation||'None'; let logsDiv=document.getElementById('logs'); let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1; logsDiv.innerHTML=d.logs.map(l=>`<span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}`).join('<br>'); if(isBottom) logsDiv.scrollTop=logsDiv.scrollHeight; }catch(e){} },1200);
-    (async()=>{ let r=await fetch('/api/settings'); let d=await r.json(); document.getElementById('set_token').value=d.my_token||''; document.getElementById('set_user').value=d.my_user||''; document.getElementById('set_bl').value=d.blacklist||''; document.getElementById('set_del').value=d.del_payload||''; document.getElementById('set_cookie').value=d.full_cookie||''; })();
+    let archFast=false, repFast=false;
+    function showToast(msg,err){let t=document.getElementById('toast');t.style.display='block';t.style.borderLeftColor=err?'#ef4444':'#10b981';t.innerHTML=msg;setTimeout(()=>t.style.display='none',3500);}
+    document.getElementById('archFastBtn').onclick=()=>{archFast=!archFast;document.getElementById('archFastBtn').innerHTML=archFast?'⚡ Fast ON':'⚡ Fast OFF';document.getElementById('archFastBtn').classList.toggle('active',archFast);};
+    document.getElementById('repFastBtn').onclick=()=>{repFast=!repFast;document.getElementById('repFastBtn').innerHTML=repFast?'⚡ Fast ON':'⚡ Fast OFF';document.getElementById('repFastBtn').classList.toggle('active',repFast);};
+    async function startSupabaseArchive(){let mode=document.getElementById('arch_mode').value,target=document.getElementById('arch_target').value.trim();if(!target){showToast("Enter target!",true);return;}let resp=await fetch('/api/supabase_archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,target,fast:archFast})});let data=await resp.json();showToast(data.message);document.getElementById('arch_target').value='';}
+    async function startReposter(){let mode=document.getElementById('rep_mode').value,input=document.getElementById('rep_input').value.trim(),limit=document.getElementById('size_limit').value;if(!input){showToast("Enter input!",true);return;}await fetch('/api/repost',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,input,size_limit:parseInt(limit),fast:repFast})});showToast("Queueing started");document.getElementById('rep_input').value='';}
+    async function runCleaner(){if(confirm("Delete duplicates?")){await fetch('/api/cleaner',{method:'POST'});showToast("Cleaner started");}}
+    async function syncUploadedTable(){if(confirm("Sync uploaded table?")){await fetch('/api/sync_uploaded',{method:'POST'});showToast("Sync started");}}
+    async function saveConfig(){let payload={my_token:document.getElementById('set_token').value,my_user:document.getElementById('set_user').value,blacklist:document.getElementById('set_bl').value,del_payload:document.getElementById('set_del').value,full_cookie:document.getElementById('set_cookie').value};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});showToast("Settings saved");}
+    async function clearLogs(){await fetch('/api/clear_logs',{method:'POST'});showToast("Logs cleared");}
+    let srcModal=document.getElementById('sourceModal'),setModal=document.getElementById('settingsModal');
+    document.getElementById('showSourcesBtn').onclick=async()=>{let r=await fetch('/api/status');let d=await r.json();let grouped=d.sources_grouped||{};let html='';for(let [type,items] of Object.entries(grouped)){html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source</th><th>Count</th></tr>`;items.forEach(i=>{html+=`<tr><td>${escapeHtml(i.value)}</td><td>${i.count}</td></tr>`;});html+=`</table></div>`;}if(!Object.keys(grouped).length)html='<p>No pending jobs.</p>';document.getElementById('sourceTableBody').innerHTML=html;srcModal.style.display='flex';};
+    function escapeHtml(s){return s.replace(/[&<>]/g,function(m){if(m==='&')return '&amp;';if(m==='<')return '&lt;';if(m==='>')return '&gt;';return m;});}
+    document.getElementById('settingsBtn').onclick=async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';setModal.style.display='flex';};
+    document.querySelectorAll('.close-modal').forEach(btn=>btn.onclick=()=>{srcModal.style.display='none';setModal.style.display='none';});
+    window.onclick=e=>{if(e.target==srcModal)srcModal.style.display='none';if(e.target==setModal)setModal.style.display='none';};
+    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-repost').innerText=d.reposter;document.getElementById('s-q').innerText=d.queue_size;document.getElementById('current-op').innerText=d.current_operation||'None';let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}`).join('<br>');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
+    (async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';})();
 </script>
 </body>
 </html>
 """
 
 # ---------------------------
-#  START THE WORKER THREAD
+#  START WORKER
 # ---------------------------
 threading.Thread(target=reposter_worker, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 V13.0 Swarm Node on port {port} | Server ID: {SERVER_ID}")
+    print(f"🚀 V14.0 Swarm Node on port {port} | Server: {SERVER_ID}")
     print(f"🔐 Admin password: {ADMIN_PASSWORD}")
     app.run(host='0.0.0.0', port=port, threaded=True)
