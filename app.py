@@ -6,6 +6,14 @@ import psycopg2
 app = Flask(__name__)
 
 # ---------------------------
+#  HARDCODED SECRETS & DBs
+# ---------------------------
+# Everything is hardcoded directly here as requested.
+NEON_DB_URL = "postgresql://neondb_owner:npg_Rh0xIbmdFe5u@ep-quiet-block-a12aatzr-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+SUPABASE_URL = "https://cnkbewgpguyojiebztbs.supabase.co/rest/v1/reels"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNua2Jld2dwZ3V5b2ppZWJ6dGJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyODU0NzUsImV4cCI6MjA4OTg2MTQ3NX0.ldS5knPaT1imexuRH9jSlTDB1mRSpoozFXlmhbDw2fU"
+
+# ---------------------------
 #  DIRECTORIES & CONFIG
 # ---------------------------
 BASE_DIR = os.getcwd()
@@ -15,8 +23,6 @@ SETTINGS_FILE = "settings.json"
 
 for d in [VIDEO_DIR, PREVIEW_DIR]:
     if not os.path.exists(d): os.makedirs(d)
-
-NEON_DB_URL = os.getenv("NEON_DB_URL", "postgresql://neondb_owner:npg_Rh0xIbmdFe5u@ep-quiet-block-a12aatzr-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
 
 # ---------------------------
 #  NEON DB INITIALIZATION
@@ -44,15 +50,15 @@ def init_neon_db():
 init_neon_db()
 
 # ---------------------------
-#  SETTINGS MANAGER 
+#  SETTINGS MANAGER (HARDCODED DEFAULTS)
 # ---------------------------
 DEFAULT_SETTINGS = {
-    "my_token": "",
+    "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y",
     "my_user": "telugustuffs",
     "main_domain": "love.viraly.wtf", "upload_domain": "loveupload.viraly.wtf",
     "blacklist": "promo, link in bio, part 2, pt 2, subscribe",
-    "del_payload": "", 
-    "full_cookie": ""
+    "del_payload": "U2FsdGVkX1+0BWWOC9q0iGdVxXxQPvzazMUrmc4pvXw=", 
+    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
 }
 
 if not os.path.exists(SETTINGS_FILE): json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
@@ -224,11 +230,13 @@ def run_async(coroutine):
     loop.run_until_complete(coroutine)
     loop.close()
 
-async def async_db_pipeline(mode, query, size_limit=9999):
+async def async_db_pipeline(mode, query, action="supabase_only", size_limit=9999):
     current_status["scraper"] = f"Scraping {query}"
     emit_log(f"🚀 SCRAPE INITIATED | Target: '{query}'", "SCRAPE", "#3b82f6")
     conf = get_settings()
     s_headers = get_headers()
+    db_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
+    
     all_vids = set()
     page, empty_count = 0, 0
     
@@ -243,19 +251,25 @@ async def async_db_pipeline(mode, query, size_limit=9999):
                 else:
                     empty_count = 0
                     all_vids.update(vids)
+                    # Always save to Supabase as an archive
+                    await session.post(SUPABASE_URL, headers=db_headers, json=[{"id": v, "name": None, "views": 0, "likes_count": 0} for v in vids])
                 page += 1
             except: break
             
     unique_vids = list(all_vids)
     
-    new_vids = filter_existing_ids(unique_vids)
-    skipped = len(unique_vids) - len(new_vids)
-    
-    added = 0
-    for vid in new_vids:
-        if add_to_neon_queue(vid, size_limit): added += 1
+    if action == "queue":
+        # Scrape and auto-send to the worker queue for downloading
+        new_vids = filter_existing_ids(unique_vids)
+        skipped = len(unique_vids) - len(new_vids)
+        added = 0
+        for vid in new_vids:
+            if add_to_neon_queue(vid, size_limit): added += 1
+        emit_log(f"✨ Scrape Done! Found {len(unique_vids)}. Skipped {skipped} duplicates. Added {added} NEW jobs to Global Queue.", "SCRAPE", "#3b82f6")
+    else:
+        # Just scraped to Supabase
+        emit_log(f"✨ Scrape Done! Found and archived {len(unique_vids)} IDs to Supabase. (Workers remain idle)", "SCRAPE", "#3b82f6")
         
-    emit_log(f"✨ Scrape Done! Found {len(unique_vids)}. Skipped {skipped} already processed. Added {added} NEW IDs to Queue.", "SCRAPE", "#3b82f6")
     current_status["scraper"] = "Idle"
 
 # ---------------------------
@@ -283,6 +297,7 @@ def reposter_worker():
             title = f"Viral Video {video_id[:6]}"
             desc = "#trending #viral #reels"
             category_tag = "18+" 
+            original_username = ""
             
             try:
                 r_api = requests.get(f"https://{conf['main_domain']}/video/{urllib.parse.quote(video_id, safe='')}", headers=h_media, timeout=10).json()
@@ -291,14 +306,23 @@ def reposter_worker():
                 if vid_data.get("title"): title = vid_data["title"]
                 if vid_data.get("description"): desc = vid_data["description"]
                 if vid_data.get("tag"): category_tag = vid_data["tag"]
+                if vid_data.get("username"): original_username = vid_data["username"]
             except: pass
 
+            # 🛑 1. SELF-LOOP SHIELD: Did we scrape our own video from a keyword search?
+            if original_username and original_username.lower() == conf['my_user'].lower():
+                emit_log(f"⏭️ SKIPPED: Belongs to {conf['my_user']} (Self-Loop Prevented)", "REPOST", "#f43f5e")
+                update_job_status(job["id"], 'completed', "Self-loop skipped")
+                continue
+
+            # 🛑 2. Smart Blacklist Check
             bl_words = [w.strip().lower() for w in conf.get("blacklist", "").split(",") if w.strip()]
             if any(w in f"{title} {desc} {category_tag}".lower() for w in bl_words):
                 emit_log(f"🛑 BLACKLISTED: Trashing video.", "REPOST", "#ef4444")
                 update_job_status(job["id"], 'failed', "Blacklisted Keyword")
                 continue
 
+            # 3. Size Check
             d_url = f"https://{conf['main_domain']}/media/videos/{video_id}.mp4"
             size_mb = 0
             with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
@@ -344,7 +368,6 @@ def reposter_worker():
 
             response_text = up.text
             
-            # 🛡️ THE BYPASS FIX: Server throws 400 but actually succeeds saving the file!
             if up.status_code == 200 or (up.status_code == 400 and "allowedMimeTypes is not defined" in response_text):
                 emit_log(f"✅ SUCCESS ➔ {video_id[:8]} (Bypassed Bug)", "REPOST", "#10b981")
                 update_job_status(job["id"], 'completed')
@@ -366,7 +389,7 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 # ---------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V8.3 Autonomous Swarm</title>
+<title>V8.5 Autonomous Swarm</title>
 <style>
     :root { --bg: #0f172a; --panel: #1e293b; --acc: #3b82f6; --text: #f8fafc; --grn: #10b981; }
     body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; padding-bottom: 80px;}
@@ -383,7 +406,7 @@ HTML_TEMPLATE = """
     @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
 </style></head>
 <body>
-    <h2>🐝 V8.3 AUTONOMOUS SWARM NODE</h2>
+    <h2>🐝 V8.5 AUTONOMOUS SWARM NODE</h2>
     <div class="status-bar">
         <div>
             <b>[SCRAPER]</b> <span id="s-scrape" style="color:#3b82f6; margin-right:15px;">Idle</span>
@@ -394,22 +417,28 @@ HTML_TEMPLATE = """
     
     <div class="grid-2">
         <div class="card" style="border-top-color: #3b82f6;">
-            <h3>🔍 Smart DB Scraper</h3>
-            <p style="font-size:12px; color:#94a3b8; margin-top:0;">Skips IDs already in DB and pushes fresh ones to Queue!</p>
+            <h3>🔍 Smart DB Scraper (Supabase Only)</h3>
+            <p style="font-size:12px; color:#94a3b8; margin-top:0;">Scrapes IDs to your Supabase archive. Does NOT trigger worker downloads.</p>
             <div style="display:flex; gap:10px;">
                 <select id="db_mode" style="width:40%;"><option value="keyword">Keyword</option><option value="username">Username</option></select>
                 <input id="db_target" placeholder="Target keyword..." style="width:60%;">
             </div>
-            <button onclick="startScraper()">🚀 SCRAPE & ADD TO GLOBAL QUEUE</button>
+            <button onclick="startScraper()">🚀 SCRAPE TO SUPABASE ONLY</button>
         </div>
         
         <div class="card" style="border-top-color: #f59e0b;">
-            <h3>🎥 Add Jobs & Cleaner</h3>
+            <h3>🎥 Add Jobs & Cleaner (Worker Queue)</h3>
+            <p style="font-size:12px; color:#94a3b8; margin-top:0;">Scrapes targets or takes manual IDs, then sends them to workers to download & upload.</p>
             <div style="display:flex; gap:10px;">
-                <input id="rep_input" placeholder="Paste manual IDs here..." style="width:70%;">
-                <select id="size_limit" style="width:30%;"><option value="10">10 MB</option><option value="40">40 MB</option><option value="9999">Unlmt.</option></select>
+                <select id="rep_mode" style="width:35%;">
+                    <option value="manual">Manual IDs</option>
+                    <option value="keyword">Keyword Scrape</option>
+                    <option value="username">Username Scrape</option>
+                </select>
+                <input id="rep_input" placeholder="Keyword, Username, or Paste IDs..." style="width:40%;">
+                <select id="size_limit" style="width:25%;"><option value="10">10 MB</option><option value="40">40 MB</option><option value="9999">Unlmt.</option></select>
             </div>
-            <button onclick="startReposter()" class="btn-repost">⚙️ ADD TO GLOBAL QUEUE</button>
+            <button onclick="startReposter()" class="btn-repost">⚙️ SCRAPE & SEND TO QUEUE</button>
             <hr style="border-color:#334155; margin:15px 0;">
             <button onclick="runCleaner()" class="btn-red">🧹 RUN GLOBAL DB CLEANER</button>
         </div>
@@ -418,12 +447,12 @@ HTML_TEMPLATE = """
     <div class="card" style="margin-top: 15px; border-top-color:#10b981;">
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
             <h3>🖥️ Swarm Node Logs & Settings</h3>
-            <button onclick="saveConfig()" style="width:auto; padding:5px 15px; font-size:12px; background:#475569;">💾 SAVE SETTINGS</button>
+            <button onclick="saveConfig()" style="width:auto; padding:5px 15px; font-size:12px; background:#475569;">💾 SAVE OVERRIDES</button>
         </div>
         <div class="grid-2" style="margin-bottom:10px;">
             <div><span class="sm-label">Account Token</span><input id="set_token" placeholder="Access Token"></div>
             <div><span class="sm-label">Username</span><input id="set_user" placeholder="Target Username"></div>
-            <div><span class="sm-label">Encrypted Delete Payload</span><input id="set_del" placeholder="U2FsdGVkX19Y2vJS8yrBP8..."></div>
+            <div><span class="sm-label">Encrypted Delete Payload</span><input id="set_del" placeholder="U2FsdGVkX1+0BWWOC9q0iGdVxX..."></div>
             <div><span class="sm-label">Smart Blacklist</span><input id="set_bl" placeholder="promo, link in bio..."></div>
         </div>
         <div>
@@ -440,9 +469,11 @@ HTML_TEMPLATE = """
         document.getElementById('db_target').value = '';
     }
     async function startReposter() {
-        let input = document.getElementById('rep_input').value, limit = document.getElementById('size_limit').value;
-        if(!input) return alert("Enter IDs!");
-        await fetch('/api/repost', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({input:input, size_limit: parseInt(limit)})});
+        let mode = document.getElementById('rep_mode').value;
+        let input = document.getElementById('rep_input').value;
+        let limit = document.getElementById('size_limit').value;
+        if(!input) return alert("Enter target or IDs!");
+        await fetch('/api/repost', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:mode, input:input, size_limit: parseInt(limit)})});
         document.getElementById('rep_input').value = '';
     }
     async function runCleaner() {
@@ -516,24 +547,36 @@ def api_settings():
 @app.route('/api/scrape', methods=['POST'])
 def api_scrape():
     data = request.json
-    threading.Thread(target=run_async, args=(async_db_pipeline(data['mode'], data['query']),), daemon=True).start()
+    threading.Thread(target=run_async, args=(async_db_pipeline(data['mode'], data['query'], action="supabase_only"),), daemon=True).start()
     return jsonify({"status": "started"})
 
 @app.route('/api/repost', methods=['POST'])
 def api_repost():
     data = request.json
+    mode = data.get('mode', 'manual')
+    input_val = data['input']
+    size_limit = data['size_limit']
+
     def handle_queueing():
-        ids = []
-        for line in data['input'].strip().split('\n'):
-            line = line.strip()
-            if not line: continue
-            match = re.search(r'/(?:video/)?([^/?]+)', line)
-            ids.append(match.group(1) if match else line)
-            
-        new_ids = filter_existing_ids(ids)
-        skipped = len(ids) - len(new_ids)
-        added = sum(1 for vid in new_ids if add_to_neon_queue(vid, data['size_limit']))
-        emit_log(f"⚡ Manual Input: Skipped {skipped} duplicates. Added {added} NEW jobs to Global Queue", "NODE", "#f59e0b")
+        if mode == "manual":
+            ids = []
+            for line in input_val.strip().split('\n'):
+                line = line.strip()
+                if not line: continue
+                match = re.search(r'/(?:video/)?([^/?]+)', line)
+                ids.append(match.group(1) if match else line)
+                
+            new_ids = filter_existing_ids(ids)
+            skipped = len(ids) - len(new_ids)
+            added = sum(1 for vid in new_ids if add_to_neon_queue(vid, size_limit))
+            emit_log(f"⚡ Manual Input: Skipped {skipped} duplicates. Added {added} NEW jobs to Global Queue", "NODE", "#f59e0b")
+        else:
+            emit_log(f"🔍 Extracting IDs for {mode}: '{input_val}' to add to Worker Queue...", "REPOST", "#f59e0b")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(async_db_pipeline(mode, input_val, action="queue", size_limit=size_limit))
+            loop.close()
+
     threading.Thread(target=handle_queueing, daemon=True).start()
     return jsonify({"status": "queued"})
 
@@ -544,5 +587,5 @@ def api_cleaner():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 STARTING V8.3 AUTONOMOUS SWARM NODE on Port {port}...")
+    print(f"🚀 STARTING V8.5 AUTONOMOUS SWARM NODE on Port {port}...")
     app.run(host='0.0.0.0', port=port, threaded=True)
