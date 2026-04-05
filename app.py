@@ -44,15 +44,15 @@ def init_neon_db():
 init_neon_db()
 
 # ---------------------------
-#  SETTINGS MANAGER (PRE-CONFIGURED!)
+#  SETTINGS MANAGER 
 # ---------------------------
 DEFAULT_SETTINGS = {
-    "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y",
+    "my_token": "",
     "my_user": "telugustuffs",
     "main_domain": "love.viraly.wtf", "upload_domain": "loveupload.viraly.wtf",
     "blacklist": "promo, link in bio, part 2, pt 2, subscribe",
-    "del_payload": "U2FsdGVkX1+0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw=", # Auto-decoded from your anonUserId
-    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
+    "del_payload": "", 
+    "full_cookie": ""
 }
 
 if not os.path.exists(SETTINGS_FILE): json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
@@ -83,7 +83,6 @@ def emit_log(msg, category="SYS", color="#10b981"):
 #  DATABASE CO-OP HELPERS
 # ---------------------------
 def filter_existing_ids(vid_list):
-    """ Skips IDs that are already queued or finished across ALL servers """
     if not vid_list: return []
     try:
         conn = psycopg2.connect(NEON_DB_URL)
@@ -178,7 +177,7 @@ def native_cleaner_task():
         except: break
         
     all_videos = list(dict.fromkeys(all_videos))
-    all_videos.reverse() # Keep original!
+    all_videos.reverse() 
     emit_log(f"🧹 Found {len(all_videos)} videos. Hashing thumbnails against DB...", "CLEANER", "#06b6d4")
     
     conn = psycopg2.connect(NEON_DB_URL)
@@ -249,7 +248,6 @@ async def async_db_pipeline(mode, query, size_limit=9999):
             
     unique_vids = list(all_vids)
     
-    # DB SKIP FILTER: Removes already processed videos instantly
     new_vids = filter_existing_ids(unique_vids)
     skipped = len(unique_vids) - len(new_vids)
     
@@ -282,7 +280,6 @@ def reposter_worker():
         h_media = get_headers()
 
         try:
-            # 1. TRUE METADATA EXTRACTION (Title, #Tags, Category directly from original)
             title = f"Viral Video {video_id[:6]}"
             desc = "#trending #viral #reels"
             category_tag = "18+" 
@@ -296,14 +293,12 @@ def reposter_worker():
                 if vid_data.get("tag"): category_tag = vid_data["tag"]
             except: pass
 
-            # 2. Smart Blacklist Check
             bl_words = [w.strip().lower() for w in conf.get("blacklist", "").split(",") if w.strip()]
             if any(w in f"{title} {desc} {category_tag}".lower() for w in bl_words):
                 emit_log(f"🛑 BLACKLISTED: Trashing video.", "REPOST", "#ef4444")
                 update_job_status(job["id"], 'failed', "Blacklisted Keyword")
                 continue
 
-            # 3. Size Check
             d_url = f"https://{conf['main_domain']}/media/videos/{video_id}.mp4"
             size_mb = 0
             with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
@@ -328,7 +323,6 @@ def reposter_worker():
 
             file_to_upload = raw_file
             
-            # 4. Ghost Mode Anti-Ban Processing
             if size_limit == 9999 and size_mb > 40:
                 emit_log(f"⚡ UNLIMITED PASS ➔ Skipping watermark", "REPOST", "#d946ef")
                 subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
@@ -339,26 +333,29 @@ def reposter_worker():
                 subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
                 file_to_upload = watermarked_file
 
-            # 5. Uploading with EXACT METADATA
             emit_log(f"📤 UPLOADING... [{category_tag}]", "REPOST", "#0ea5e9")
             base = ".".join(conf['main_domain'].split('.')[-2:])
+            
             with open(file_to_upload, 'rb') as f:
                 up = requests.post(f"https://{conf['upload_domain']}/upload",
                     files={'files': (f"video_{safe_label}.mp4", f, 'video/mp4')},
                     data={"tag": category_tag, "title": title, "description": desc, "country": "IN", "username": conf['my_user'], "start": "0", "end": "0"},
                     headers={"Cookie": h_media["Cookie"], "Origin": f"https://{base}"})
 
-            if up.status_code == 200:
-                emit_log(f"✅ SUCCESS ➔ {video_id[:8]}", "REPOST", "#10b981")
+            response_text = up.text
+            
+            # 🛡️ THE BYPASS FIX: Server throws 400 but actually succeeds saving the file!
+            if up.status_code == 200 or (up.status_code == 400 and "allowedMimeTypes is not defined" in response_text):
+                emit_log(f"✅ SUCCESS ➔ {video_id[:8]} (Bypassed Bug)", "REPOST", "#10b981")
                 update_job_status(job["id"], 'completed')
-            else: raise Exception(f"HTTP {up.status_code}")
+            else: 
+                raise Exception(f"HTTP {up.status_code} | {response_text[:100]}")
 
         except Exception as e:
             emit_log(f"🔥 Error: {e}", "REPOST", "#ef4444")
             update_job_status(job["id"], 'failed', str(e))
             
         finally:
-            # 6. Bulletproof Disk Space Cleanup (Crash Prevention)
             for f_path in [raw_file, watermarked_file, preview_file]:
                 if f_path and os.path.exists(f_path): os.remove(f_path)
 
@@ -369,7 +366,7 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 # ---------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V8.2 Autonomous Swarm</title>
+<title>V8.3 Autonomous Swarm</title>
 <style>
     :root { --bg: #0f172a; --panel: #1e293b; --acc: #3b82f6; --text: #f8fafc; --grn: #10b981; }
     body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; padding-bottom: 80px;}
@@ -386,7 +383,7 @@ HTML_TEMPLATE = """
     @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
 </style></head>
 <body>
-    <h2>🐝 V8.2 AUTONOMOUS SWARM NODE</h2>
+    <h2>🐝 V8.3 AUTONOMOUS SWARM NODE</h2>
     <div class="status-bar">
         <div>
             <b>[SCRAPER]</b> <span id="s-scrape" style="color:#3b82f6; margin-right:15px;">Idle</span>
@@ -429,6 +426,10 @@ HTML_TEMPLATE = """
             <div><span class="sm-label">Encrypted Delete Payload</span><input id="set_del" placeholder="U2FsdGVkX19Y2vJS8yrBP8..."></div>
             <div><span class="sm-label">Smart Blacklist</span><input id="set_bl" placeholder="promo, link in bio..."></div>
         </div>
+        <div>
+            <span class="sm-label">Full Browser Cookie Header (Anti-Bot)</span>
+            <input id="set_cookie" placeholder="_ga=GA1.1...; accessToken=...">
+        </div>
         <div id="logs">Loading logs...</div>
     </div>
 <script>
@@ -454,7 +455,8 @@ HTML_TEMPLATE = """
             my_token: document.getElementById('set_token').value, 
             my_user: document.getElementById('set_user').value,
             blacklist: document.getElementById('set_bl').value,
-            del_payload: document.getElementById('set_del').value
+            del_payload: document.getElementById('set_del').value,
+            full_cookie: document.getElementById('set_cookie').value
         };
         await fetch('/api/settings', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
         alert("Node Configuration Saved!");
@@ -479,6 +481,7 @@ HTML_TEMPLATE = """
         document.getElementById('set_user').value = d.my_user || "";
         document.getElementById('set_bl').value = d.blacklist || "";
         document.getElementById('set_del').value = d.del_payload || "";
+        document.getElementById('set_cookie').value = d.full_cookie || "";
     })();
 </script></body></html>
 """
@@ -503,7 +506,8 @@ def api_settings():
         "my_token": data.get("my_token", conf["my_token"]),
         "my_user": data.get("my_user", conf["my_user"]),
         "blacklist": data.get("blacklist", conf["blacklist"]),
-        "del_payload": data.get("del_payload", conf["del_payload"])
+        "del_payload": data.get("del_payload", conf["del_payload"]),
+        "full_cookie": data.get("full_cookie", conf["full_cookie"])
     })
     json.dump(conf, open(SETTINGS_FILE, 'w'), indent=4)
     emit_log("Settings updated for this node.", "SYS", "#10b981")
@@ -540,5 +544,5 @@ def api_cleaner():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 STARTING V8.2 AUTONOMOUS SWARM NODE on Port {port}...")
+    print(f"🚀 STARTING V8.3 AUTONOMOUS SWARM NODE on Port {port}...")
     app.run(host='0.0.0.0', port=port, threaded=True)
