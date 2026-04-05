@@ -395,19 +395,25 @@ async def async_scrape_ids(mode, query):
                 break
     return list(all_vids)
 
+# FIXED: Extract video ID from URL or raw ID (supports base64 with =)
 def extract_video_id_from_input(input_str):
     input_str = input_str.strip()
-    # Match both raw ID and URL like https://viraly.wtf/XXXXX
-    match = re.search(r'(?:video/)?([A-Za-z0-9_-]{20,})', input_str)
-    if match:
-        return match.group(1)
-    # Fallback: if input looks like a short ID (e.g., 20+ chars)
-    if re.match(r'^[A-Za-z0-9_-]{20,}$', input_str):
+    # If it's a URL, extract the last path segment
+    if input_str.startswith('http://') or input_str.startswith('https://'):
+        parsed = urllib.parse.urlparse(input_str)
+        path = parsed.path.rstrip('/')
+        # Get the last part of the path
+        last_segment = path.split('/')[-1]
+        if last_segment:
+            return last_segment
+    # Otherwise, treat as raw ID - allow alphanumeric, underscore, dash, equals, plus, slash
+    # Video IDs are often base64-like, so allow [A-Za-z0-9_\-=+/]
+    if re.match(r'^[A-Za-z0-9_\-=+/]+$', input_str):
         return input_str
     return None
 
 # ---------------------------
-#  WORKER ENGINE (with detailed logs)
+#  WORKER ENGINE
 # ---------------------------
 def reposter_worker():
     global current_status
@@ -424,8 +430,8 @@ def reposter_worker():
         conf = get_settings()
         h_media = get_headers()
         try:
-            # Thumbnail duplicate check
             domain = conf['main_domain']
+            # Thumbnail duplicate check
             thumb_url = f"https://{domain}/media/images/{video_id}.jpg"
             thumb_resp = requests.get(thumb_url, headers=h_media, timeout=8)
             thumb_hash = None
@@ -437,7 +443,7 @@ def reposter_worker():
                     continue
             else:
                 emit_log(f"⚠️ Could not fetch thumbnail for hash check, proceeding anyway", "REPOST", "#f59e0b")
-            # Fetch video metadata
+            # Fetch metadata
             title = f"Viral Video {video_id[:6]}"
             desc = "#trending #viral #reels"
             category_tag = "18+"
@@ -451,7 +457,7 @@ def reposter_worker():
                 if vid_data.get("username"): original_username = vid_data["username"]
             except Exception as e:
                 emit_log(f"Metadata fetch failed: {e}", "REPOST", "#ef4444", is_error=True)
-            # Self-loop shield
+            # Self-loop
             if original_username and original_username.lower() == conf['my_user'].lower():
                 emit_log(f"⏭️ SKIPPED: Belongs to {conf['my_user']} (Self-Loop)", "REPOST", "#f43f5e")
                 update_job_status(job["id"], 'completed', "Self-loop skipped")
@@ -526,7 +532,7 @@ def reposter_worker():
 threading.Thread(target=reposter_worker, daemon=True).start()
 
 # ---------------------------
-#  FLASK WEB UI (Two Sections with better feedback)
+#  FLASK WEB UI
 # ---------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -712,7 +718,6 @@ def health():
 @app.route('/api/status')
 def api_status():
     current_status["queue_size"] = get_queue_size()
-    # Convert log_messages to serializable list
     logs_serializable = []
     for log in log_messages:
         logs_serializable.append({
@@ -778,6 +783,7 @@ def api_repost():
     def handle_queueing():
         if mode == "manual":
             ids = []
+            # Split by newline or comma
             for line in input_val.replace(',', '\n').split('\n'):
                 line = line.strip()
                 if not line: continue
