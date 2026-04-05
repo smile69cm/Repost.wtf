@@ -44,19 +44,28 @@ def init_neon_db():
 init_neon_db()
 
 # ---------------------------
-#  SETTINGS MANAGER
+#  SETTINGS MANAGER (PRE-CONFIGURED!)
 # ---------------------------
 DEFAULT_SETTINGS = {
-    "my_token": "", "my_user": "telugustuffs",
+    "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y",
+    "my_user": "telugustuffs",
     "main_domain": "love.viraly.wtf", "upload_domain": "loveupload.viraly.wtf",
     "blacklist": "promo, link in bio, part 2, pt 2, subscribe",
-    "del_payload": ""
+    "del_payload": "U2FsdGVkX1+0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw=", # Auto-decoded from your anonUserId
+    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
 }
 
 if not os.path.exists(SETTINGS_FILE): json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
 
 def get_settings():
     with open(SETTINGS_FILE, 'r') as f: return json.load(f)
+
+def get_headers():
+    conf = get_settings()
+    return {
+        "Cookie": conf.get("full_cookie", f"accessToken={conf['my_token']}; allow18=%7B%22allow18%22%3Atrue%7D"),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
 # ---------------------------
 #  LOGGER & STATUS
@@ -74,7 +83,7 @@ def emit_log(msg, category="SYS", color="#10b981"):
 #  DATABASE CO-OP HELPERS
 # ---------------------------
 def filter_existing_ids(vid_list):
-    """ Checks the DB and removes IDs that have already been queued or processed """
+    """ Skips IDs that are already queued or finished across ALL servers """
     if not vid_list: return []
     try:
         conn = psycopg2.connect(NEON_DB_URL)
@@ -142,7 +151,6 @@ def native_cleaner_task():
     conf = get_settings()
     payload = conf.get("del_payload", "")
     username = conf.get("my_user")
-    token = conf.get("my_token")
     domain = conf.get("main_domain")
     
     if not payload:
@@ -154,7 +162,7 @@ def native_cleaner_task():
     
     all_videos = []
     page, empty_pages = 0, 0
-    headers = {"Cookie": f"accessToken={token}; allow18=%7B%22allow18%22%3Atrue%7D"}
+    headers = get_headers()
     session = requests.Session()
     
     while empty_pages < 2 and page < 80:
@@ -170,7 +178,7 @@ def native_cleaner_task():
         except: break
         
     all_videos = list(dict.fromkeys(all_videos))
-    all_videos.reverse() 
+    all_videos.reverse() # Keep original!
     emit_log(f"🧹 Found {len(all_videos)} videos. Hashing thumbnails against DB...", "CLEANER", "#06b6d4")
     
     conn = psycopg2.connect(NEON_DB_URL)
@@ -221,7 +229,7 @@ async def async_db_pipeline(mode, query, size_limit=9999):
     current_status["scraper"] = f"Scraping {query}"
     emit_log(f"🚀 SCRAPE INITIATED | Target: '{query}'", "SCRAPE", "#3b82f6")
     conf = get_settings()
-    s_headers = {"Cookie": f"accessToken={conf['my_token']}; allow18=%7B%22allow18%22%3Atrue%7D", "User-Agent": "Mozilla/5.0"}
+    s_headers = get_headers()
     all_vids = set()
     page, empty_count = 0, 0
     
@@ -241,11 +249,10 @@ async def async_db_pipeline(mode, query, size_limit=9999):
             
     unique_vids = list(all_vids)
     
-    # FILTER OUT ALREADY DONE IDs
+    # DB SKIP FILTER: Removes already processed videos instantly
     new_vids = filter_existing_ids(unique_vids)
     skipped = len(unique_vids) - len(new_vids)
     
-    # Automatically add the fresh IDs to the Global Queue!
     added = 0
     for vid in new_vids:
         if add_to_neon_queue(vid, size_limit): added += 1
@@ -272,15 +279,16 @@ def reposter_worker():
         
         raw_file, watermarked_file, preview_file = None, None, None
         conf = get_settings()
+        h_media = get_headers()
 
         try:
-            # TRUE METADATA EXTRACTION (Title, Description with #tags, Category)
+            # 1. TRUE METADATA EXTRACTION (Title, #Tags, Category directly from original)
             title = f"Viral Video {video_id[:6]}"
-            desc = "#trending #viral"
+            desc = "#trending #viral #reels"
             category_tag = "18+" 
             
             try:
-                r_api = requests.get(f"https://{conf['main_domain']}/video/{urllib.parse.quote(video_id, safe='')}", headers={"Cookie": f"accessToken={conf['my_token']}"}, timeout=10).json()
+                r_api = requests.get(f"https://{conf['main_domain']}/video/{urllib.parse.quote(video_id, safe='')}", headers=h_media, timeout=10).json()
                 vid_data = r_api[0] if isinstance(r_api, list) and len(r_api) > 0 else (r_api if isinstance(r_api, dict) else {})
                 
                 if vid_data.get("title"): title = vid_data["title"]
@@ -288,17 +296,15 @@ def reposter_worker():
                 if vid_data.get("tag"): category_tag = vid_data["tag"]
             except: pass
 
-            # Smart Blacklist Check
+            # 2. Smart Blacklist Check
             bl_words = [w.strip().lower() for w in conf.get("blacklist", "").split(",") if w.strip()]
             if any(w in f"{title} {desc} {category_tag}".lower() for w in bl_words):
                 emit_log(f"🛑 BLACKLISTED: Trashing video.", "REPOST", "#ef4444")
                 update_job_status(job["id"], 'failed', "Blacklisted Keyword")
                 continue
 
-            # Size Check
+            # 3. Size Check
             d_url = f"https://{conf['main_domain']}/media/videos/{video_id}.mp4"
-            h_media = {"Cookie": f"accessToken={conf['my_token']}; allow18=%7B%22allow18%22%3Atrue%7D", "User-Agent": "Mozilla/5.0"}
-            
             size_mb = 0
             with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
                 if r_size.status_code == 200 and 'content-length' in r_size.headers:
@@ -322,7 +328,7 @@ def reposter_worker():
 
             file_to_upload = raw_file
             
-            # Ghost Mode Processing
+            # 4. Ghost Mode Anti-Ban Processing
             if size_limit == 9999 and size_mb > 40:
                 emit_log(f"⚡ UNLIMITED PASS ➔ Skipping watermark", "REPOST", "#d946ef")
                 subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
@@ -333,13 +339,14 @@ def reposter_worker():
                 subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
                 file_to_upload = watermarked_file
 
+            # 5. Uploading with EXACT METADATA
             emit_log(f"📤 UPLOADING... [{category_tag}]", "REPOST", "#0ea5e9")
             base = ".".join(conf['main_domain'].split('.')[-2:])
             with open(file_to_upload, 'rb') as f:
                 up = requests.post(f"https://{conf['upload_domain']}/upload",
                     files={'files': (f"video_{safe_label}.mp4", f, 'video/mp4')},
                     data={"tag": category_tag, "title": title, "description": desc, "country": "IN", "username": conf['my_user'], "start": "0", "end": "0"},
-                    headers={"Cookie": f"accessToken={conf['my_token']}", "Origin": f"https://{base}"})
+                    headers={"Cookie": h_media["Cookie"], "Origin": f"https://{base}"})
 
             if up.status_code == 200:
                 emit_log(f"✅ SUCCESS ➔ {video_id[:8]}", "REPOST", "#10b981")
@@ -351,7 +358,7 @@ def reposter_worker():
             update_job_status(job["id"], 'failed', str(e))
             
         finally:
-            # Bulletproof Disk Cleanup
+            # 6. Bulletproof Disk Space Cleanup (Crash Prevention)
             for f_path in [raw_file, watermarked_file, preview_file]:
                 if f_path and os.path.exists(f_path): os.remove(f_path)
 
@@ -362,7 +369,7 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 # ---------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V8.1 Autonomous Swarm</title>
+<title>V8.2 Autonomous Swarm</title>
 <style>
     :root { --bg: #0f172a; --panel: #1e293b; --acc: #3b82f6; --text: #f8fafc; --grn: #10b981; }
     body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; padding-bottom: 80px;}
@@ -379,7 +386,7 @@ HTML_TEMPLATE = """
     @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
 </style></head>
 <body>
-    <h2>🐝 V8.1 AUTONOMOUS SWARM NODE</h2>
+    <h2>🐝 V8.2 AUTONOMOUS SWARM NODE</h2>
     <div class="status-bar">
         <div>
             <b>[SCRAPER]</b> <span id="s-scrape" style="color:#3b82f6; margin-right:15px;">Idle</span>
@@ -533,5 +540,5 @@ def api_cleaner():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 STARTING V8.1 AUTONOMOUS SWARM NODE on Port {port}...")
+    print(f"🚀 STARTING V8.2 AUTONOMOUS SWARM NODE on Port {port}...")
     app.run(host='0.0.0.0', port=port, threaded=True)
