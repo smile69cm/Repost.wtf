@@ -2,13 +2,13 @@ import os, json, time, subprocess, requests, threading, random, re, urllib.parse
 import asyncio, aiohttp, hashlib
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
 import psycopg2
+from psycopg2.extras import execute_values
 
 app = Flask(__name__)
 
 # ---------------------------
 #  HARDCODED SECRETS & DBs
 # ---------------------------
-# Everything is hardcoded directly here as requested.
 NEON_DB_URL = "postgresql://neondb_owner:npg_Rh0xIbmdFe5u@ep-quiet-block-a12aatzr-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 SUPABASE_URL = "https://cnkbewgpguyojiebztbs.supabase.co/rest/v1/reels"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNua2Jld2dwZ3V5b2ppZWJ6dGJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyODU0NzUsImV4cCI6MjA4OTg2MTQ3NX0.ldS5knPaT1imexuRH9jSlTDB1mRSpoozFXlmhbDw2fU"
@@ -43,6 +43,17 @@ def init_neon_db():
             
             cur.execute("CREATE TABLE IF NOT EXISTS image_hashes (vid TEXT PRIMARY KEY, hash TEXT);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON repost_queue(status);")
+            
+            # New table to track already uploaded videos (by hash) across all workers
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS uploaded_videos (
+                    hash TEXT PRIMARY KEY,
+                    video_id TEXT NOT NULL,
+                    original_source_id TEXT,
+                    uploaded_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_hash ON uploaded_videos(hash);")
             conn.commit()
         conn.close()
     except Exception as e: print(f"⚠️ Neon DB Init Error: {e}")
@@ -50,7 +61,7 @@ def init_neon_db():
 init_neon_db()
 
 # ---------------------------
-#  SETTINGS MANAGER (HARDCODED DEFAULTS)
+#  SETTINGS MANAGER
 # ---------------------------
 DEFAULT_SETTINGS = {
     "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y",
@@ -58,7 +69,7 @@ DEFAULT_SETTINGS = {
     "main_domain": "love.viraly.wtf", "upload_domain": "loveupload.viraly.wtf",
     "blacklist": "promo, link in bio, part 2, pt 2, subscribe",
     "del_payload": "U2FsdGVkX1+0BWWOC9q0iGdVxXxQPvzazMUrmc4pvXw=", 
-    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9qOiGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
+    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9q0iGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
 }
 
 if not os.path.exists(SETTINGS_FILE): json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
@@ -83,10 +94,29 @@ def emit_log(msg, category="SYS", color="#10b981"):
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] [NODE] [{category}] {msg}")
     log_messages.append(f"<span style='color:#64748b'>[{t}]</span> <span style='color:{color}'>[{category}]</span> {msg}")
-    if len(log_messages) > 150: log_messages.pop(0)
+    if len(log_messages) > 200: log_messages.pop(0)
 
 # ---------------------------
-#  DATABASE CO-OP HELPERS
+#  SUPABASE HELPERS (for archival only)
+# ---------------------------
+def insert_into_supabase(video_ids):
+    """Insert list of video IDs into Supabase reels table (for the user's site)"""
+    if not video_ids:
+        return
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
+    # Supabase expects array of objects
+    records = [{"id": vid, "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S")} for vid in video_ids]
+    try:
+        r = requests.post(SUPABASE_URL, headers=headers, json=records, timeout=10)
+        if r.status_code >= 400:
+            emit_log(f"Supabase insert error: {r.text[:200]}", "SUPABASE", "#ef4444")
+        else:
+            emit_log(f"Archived {len(video_ids)} IDs to Supabase", "SUPABASE", "#10b981")
+    except Exception as e:
+        emit_log(f"Supabase connection error: {e}", "SUPABASE", "#ef4444")
+
+# ---------------------------
+#  DATABASE QUEUE HELPERS
 # ---------------------------
 def filter_existing_ids(vid_list):
     if not vid_list: return []
@@ -149,8 +179,84 @@ def get_queue_size():
         return count
     except: return 0
 
+def is_video_already_uploaded(thumbnail_hash):
+    """Check if a video with this thumbnail hash already exists in uploaded_videos table"""
+    if not thumbnail_hash:
+        return False
+    try:
+        conn = psycopg2.connect(NEON_DB_URL)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM uploaded_videos WHERE hash = %s LIMIT 1", (thumbnail_hash,))
+            exists = cur.fetchone() is not None
+        conn.close()
+        return exists
+    except:
+        return False
+
+def mark_video_uploaded(thumbnail_hash, account_video_id, original_source_id):
+    """Record that a video has been successfully uploaded to the account"""
+    try:
+        conn = psycopg2.connect(NEON_DB_URL)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO uploaded_videos (hash, video_id, original_source_id) VALUES (%s, %s, %s) ON CONFLICT (hash) DO NOTHING",
+                        (thumbnail_hash, account_video_id, original_source_id))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        emit_log(f"Failed to mark uploaded: {e}", "DB", "#ef4444")
+
 # ---------------------------
-#  NATIVE DUPLICATE CLEANER
+#  PROFILE SYNC (for duplicate cleaner)
+# ---------------------------
+def sync_uploaded_videos_from_profile():
+    """Fetch all videos from the user's profile, compute their thumbnail hashes, and sync with uploaded_videos table."""
+    conf = get_settings()
+    domain = conf.get("main_domain")
+    username = conf.get("my_user")
+    headers = get_headers()
+    
+    emit_log("🔄 Syncing uploaded videos table with profile...", "CLEANER", "#06b6d4")
+    all_videos = []
+    page, empty_pages = 0, 0
+    session = requests.Session()
+    
+    while empty_pages < 2 and page < 80:
+        try:
+            res = session.post(f"https://{domain}/profile/{username}/videos/latest", headers=headers, json={"page": page}, timeout=15)
+            vids = re.findall(r'"videoId":"([^"]+)"', res.text)
+            if not vids:
+                empty_pages += 1
+            else:
+                empty_pages = 0
+                all_videos.extend(vids)
+            page += 1
+            time.sleep(0.5)
+        except:
+            break
+    
+    all_videos = list(dict.fromkeys(all_videos))
+    emit_log(f"Found {len(all_videos)} videos in profile. Hashing thumbnails...", "CLEANER", "#06b6d4")
+    
+    conn = psycopg2.connect(NEON_DB_URL)
+    cur = conn.cursor()
+    
+    for vid in all_videos:
+        try:
+            img_res = session.get(f"https://{domain}/media/images/{vid}.jpg", stream=True, timeout=8)
+            if img_res.status_code == 200:
+                img_hash = hashlib.md5(img_res.content).hexdigest()
+                cur.execute("INSERT INTO uploaded_videos (hash, video_id, original_source_id) VALUES (%s, %s, %s) ON CONFLICT (hash) DO UPDATE SET video_id = EXCLUDED.video_id",
+                            (img_hash, vid, vid))
+            else:
+                continue
+        except:
+            continue
+    conn.commit()
+    conn.close()
+    emit_log(f"✅ Synced {len(all_videos)} uploaded videos into database.", "CLEANER", "#10b981")
+
+# ---------------------------
+#  DUPLICATE CLEANER (deletes duplicates from account)
 # ---------------------------
 def native_cleaner_task():
     conf = get_settings()
@@ -219,10 +325,14 @@ def native_cleaner_task():
 
     conn.close()
     emit_log(f"✨ CLEANUP COMPLETE! Destroyed {deleted_count} duplicates.", "CLEANER", "#10b981")
+    
+    # After deletion, re-sync the uploaded_videos table to reflect current profile state
+    sync_uploaded_videos_from_profile()
+    
     current_status["scraper"] = "Idle"
 
 # ---------------------------
-#  SCRAPER MODULE
+#  SCRAPER MODULE (works for both Supabase-only and queue addition)
 # ---------------------------
 def run_async(coroutine):
     loop = asyncio.new_event_loop()
@@ -230,50 +340,46 @@ def run_async(coroutine):
     loop.run_until_complete(coroutine)
     loop.close()
 
-async def async_db_pipeline(mode, query, action="supabase_only", size_limit=9999):
-    current_status["scraper"] = f"Scraping {query}"
-    emit_log(f"🚀 SCRAPE INITIATED | Target: '{query}'", "SCRAPE", "#3b82f6")
+async def async_scrape_ids(mode, query):
+    """Scrape video IDs from target domain based on mode (username/keyword). Returns list of IDs."""
     conf = get_settings()
     s_headers = get_headers()
-    db_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-    
     all_vids = set()
     page, empty_count = 0, 0
     
     async with aiohttp.ClientSession() as session:
         while empty_count < 3 and page < 50:
             try:
-                url = f"https://{conf['main_domain']}/profile/{query}/videos/latest" if mode == "username" else f"https://{conf['main_domain']}/searchVideo?q={query}&p={page}"
-                async with session.get(url, headers=s_headers, timeout=10) if mode != "username" else session.post(url, headers=s_headers, json={"page": page}, timeout=10) as r:
-                    text = await r.text()
+                if mode == "username":
+                    url = f"https://{conf['main_domain']}/profile/{query}/videos/latest"
+                    async with session.post(url, headers=s_headers, json={"page": page}, timeout=10) as r:
+                        text = await r.text()
+                else:  # keyword
+                    url = f"https://{conf['main_domain']}/searchVideo?q={query}&p={page}"
+                    async with session.get(url, headers=s_headers, timeout=10) as r:
+                        text = await r.text()
                 vids = re.findall(r'"videoId":"([^"]+)"', text)
-                if not vids: empty_count += 1
+                if not vids:
+                    empty_count += 1
                 else:
                     empty_count = 0
                     all_vids.update(vids)
-                    # Always save to Supabase as an archive
-                    await session.post(SUPABASE_URL, headers=db_headers, json=[{"id": v, "name": None, "views": 0, "likes_count": 0} for v in vids])
                 page += 1
-            except: break
-            
-    unique_vids = list(all_vids)
-    
-    if action == "queue":
-        # Scrape and auto-send to the worker queue for downloading
-        new_vids = filter_existing_ids(unique_vids)
-        skipped = len(unique_vids) - len(new_vids)
-        added = 0
-        for vid in new_vids:
-            if add_to_neon_queue(vid, size_limit): added += 1
-        emit_log(f"✨ Scrape Done! Found {len(unique_vids)}. Skipped {skipped} duplicates. Added {added} NEW jobs to Global Queue.", "SCRAPE", "#3b82f6")
-    else:
-        # Just scraped to Supabase
-        emit_log(f"✨ Scrape Done! Found and archived {len(unique_vids)} IDs to Supabase. (Workers remain idle)", "SCRAPE", "#3b82f6")
-        
-    current_status["scraper"] = "Idle"
+            except:
+                break
+    return list(all_vids)
+
+def extract_video_id_from_input(input_str):
+    """Extract a single video ID from a URL or raw ID string."""
+    input_str = input_str.strip()
+    # Check if it looks like a URL
+    match = re.search(r'(?:video/)?([a-zA-Z0-9_-]{10,})', input_str)
+    if match:
+        return match.group(1)
+    return input_str if input_str else None
 
 # ---------------------------
-#  CORE WORKER ENGINE
+#  CORE WORKER ENGINE (with duplicate prevention)
 # ---------------------------
 def reposter_worker():
     global current_status
@@ -294,13 +400,26 @@ def reposter_worker():
         h_media = get_headers()
 
         try:
+            # ----- DUPLICATE PRE-CHECK using thumbnail hash -----
+            domain = conf['main_domain']
+            thumb_url = f"https://{domain}/media/images/{video_id}.jpg"
+            thumb_resp = requests.get(thumb_url, headers=h_media, timeout=8)
+            if thumb_resp.status_code == 200:
+                thumb_hash = hashlib.md5(thumb_resp.content).hexdigest()
+                if is_video_already_uploaded(thumb_hash):
+                    emit_log(f"⏭️ SKIPPED (duplicate hash): {video_id[:8]} already uploaded", "REPOST", "#f43f5e")
+                    update_job_status(job["id"], 'completed', "Duplicate skipped (hash match)")
+                    continue
+            else:
+                emit_log(f"⚠️ Could not fetch thumbnail for hash check, proceeding anyway", "REPOST", "#f59e0b")
+            
             title = f"Viral Video {video_id[:6]}"
             desc = "#trending #viral #reels"
             category_tag = "18+" 
             original_username = ""
             
             try:
-                r_api = requests.get(f"https://{conf['main_domain']}/video/{urllib.parse.quote(video_id, safe='')}", headers=h_media, timeout=10).json()
+                r_api = requests.get(f"https://{domain}/video/{urllib.parse.quote(video_id, safe='')}", headers=h_media, timeout=10).json()
                 vid_data = r_api[0] if isinstance(r_api, list) and len(r_api) > 0 else (r_api if isinstance(r_api, dict) else {})
                 
                 if vid_data.get("title"): title = vid_data["title"]
@@ -309,21 +428,21 @@ def reposter_worker():
                 if vid_data.get("username"): original_username = vid_data["username"]
             except: pass
 
-            # 🛑 1. SELF-LOOP SHIELD: Did we scrape our own video from a keyword search?
+            # Self-loop shield
             if original_username and original_username.lower() == conf['my_user'].lower():
-                emit_log(f"⏭️ SKIPPED: Belongs to {conf['my_user']} (Self-Loop Prevented)", "REPOST", "#f43f5e")
+                emit_log(f"⏭️ SKIPPED: Belongs to {conf['my_user']} (Self-Loop)", "REPOST", "#f43f5e")
                 update_job_status(job["id"], 'completed', "Self-loop skipped")
                 continue
 
-            # 🛑 2. Smart Blacklist Check
+            # Blacklist check
             bl_words = [w.strip().lower() for w in conf.get("blacklist", "").split(",") if w.strip()]
             if any(w in f"{title} {desc} {category_tag}".lower() for w in bl_words):
                 emit_log(f"🛑 BLACKLISTED: Trashing video.", "REPOST", "#ef4444")
                 update_job_status(job["id"], 'failed', "Blacklisted Keyword")
                 continue
 
-            # 3. Size Check
-            d_url = f"https://{conf['main_domain']}/media/videos/{video_id}.mp4"
+            # Size check
+            d_url = f"https://{domain}/media/videos/{video_id}.mp4"
             size_mb = 0
             with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
                 if r_size.status_code == 200 and 'content-length' in r_size.headers:
@@ -347,8 +466,10 @@ def reposter_worker():
 
             file_to_upload = raw_file
             
+            # Watermark decision: if size_limit == 9999 (no limit) and video > 40MB -> skip watermark
+            # Otherwise apply watermark (including when size_limit == 9999 but video <= 40MB)
             if size_limit == 9999 and size_mb > 40:
-                emit_log(f"⚡ UNLIMITED PASS ➔ Skipping watermark", "REPOST", "#d946ef")
+                emit_log(f"⚡ NO LIMIT & >40MB ➔ Skipping watermark", "REPOST", "#d946ef")
                 subprocess.run(['ffmpeg', '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
             else:
                 emit_log(f"👻 GHOST WATERMARKING (Anti-Ban)...", "REPOST", "#d946ef")
@@ -369,6 +490,12 @@ def reposter_worker():
             response_text = up.text
             
             if up.status_code == 200 or (up.status_code == 400 and "allowedMimeTypes is not defined" in response_text):
+                # Extract uploaded video ID from response if possible, otherwise use original ID
+                uploaded_video_id = re.search(r'"videoId":"([^"]+)"', response_text)
+                uploaded_video_id = uploaded_video_id.group(1) if uploaded_video_id else video_id
+                # Mark as uploaded using thumbnail hash
+                if thumb_resp.status_code == 200:
+                    mark_video_uploaded(thumb_hash, uploaded_video_id, video_id)
                 emit_log(f"✅ SUCCESS ➔ {video_id[:8]} (Bypassed Bug)", "REPOST", "#10b981")
                 update_job_status(job["id"], 'completed')
             else: 
@@ -382,31 +509,36 @@ def reposter_worker():
             for f_path in [raw_file, watermarked_file, preview_file]:
                 if f_path and os.path.exists(f_path): os.remove(f_path)
 
+# Start worker thread
 threading.Thread(target=reposter_worker, daemon=True).start()
 
 # ---------------------------
-#  FLASK WEB UI
+#  FLASK WEB UI (Two Sections)
 # ---------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V8.5 Autonomous Swarm</title>
+<title>V9.0 Dual-Mode Swarm</title>
 <style>
     :root { --bg: #0f172a; --panel: #1e293b; --acc: #3b82f6; --text: #f8fafc; --grn: #10b981; }
     body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; padding-bottom: 80px;}
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-    .card { background: var(--panel); border-radius: 8px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border-top: 3px solid var(--acc); }
+    .card { background: var(--panel); border-radius: 8px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border-top: 3px solid var(--acc); margin-bottom: 15px; }
     h2, h3 { margin-top: 0; color: #fff; }
     input, select, textarea, button { width: 100%; padding: 12px; margin-top: 8px; border-radius: 4px; border: 1px solid #334155; background: #020617; color: #fff; box-sizing: border-box; }
     button { background: var(--acc); color: #fff; font-weight: bold; border: none; cursor: pointer; transition: 0.2s; }
     button:hover { filter: brightness(1.2); }
-    .btn-sync { background: #8b5cf6; } .btn-repost { background: #f59e0b; } .btn-red { background: #ef4444; }
+    .btn-supabase { background: #8b5cf6; } .btn-repost { background: #f59e0b; } .btn-red { background: #ef4444; } .btn-sync { background: #10b981; }
     #logs { height: 400px; overflow-y: auto; background: #020617; padding: 15px; font-family: 'Consolas', monospace; font-size: 13px; border-radius: 6px; margin-top: 10px; border: 1px solid #334155; line-height: 1.6;}
     .status-bar { display: flex; justify-content: space-between; background: #020617; padding: 12px; border-radius: 6px; font-size: 14px; margin-bottom: 15px; border-left: 4px solid var(--grn); align-items:center; flex-wrap: wrap; gap:10px;}
     .sm-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; display:block; margin-top: 10px; }
+    .inline-group { display: flex; gap: 10px; align-items: center; }
+    .inline-group > * { margin-top: 0; }
+    hr { border-color: #334155; margin: 15px 0; }
     @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
-</style></head>
+</style>
+</head>
 <body>
-    <h2>🐝 V8.5 AUTONOMOUS SWARM NODE</h2>
+    <h2>🐝 V9.0 DUAL-MODE SWARM NODE</h2>
     <div class="status-bar">
         <div>
             <b>[SCRAPER]</b> <span id="s-scrape" style="color:#3b82f6; margin-right:15px;">Idle</span>
@@ -416,31 +548,47 @@ HTML_TEMPLATE = """
     </div>
     
     <div class="grid-2">
-        <div class="card" style="border-top-color: #3b82f6;">
-            <h3>🔍 Smart DB Scraper (Supabase Only)</h3>
-            <p style="font-size:12px; color:#94a3b8; margin-top:0;">Scrapes IDs to your Supabase archive. Does NOT trigger worker downloads.</p>
-            <div style="display:flex; gap:10px;">
-                <select id="db_mode" style="width:40%;"><option value="keyword">Keyword</option><option value="username">Username</option></select>
-                <input id="db_target" placeholder="Target keyword..." style="width:60%;">
+        <!-- SECTION 1: SUPABASE ARCHIVER (Only scrapes to your site's DB) -->
+        <div class="card" style="border-top-color: #8b5cf6;">
+            <h3>📦 SECTION 1: Supabase Archiver</h3>
+            <p style="font-size:12px; color:#94a3b8;">Scrape video IDs and store them to your Supabase database (for your site only). No worker download.</p>
+            <div class="inline-group">
+                <select id="arch_mode" style="width:35%;">
+                    <option value="keyword">Keyword</option>
+                    <option value="username">Username</option>
+                    <option value="single">Single ID/Link</option>
+                </select>
+                <input id="arch_target" placeholder="Keyword, username, or video link/ID..." style="width:65%;">
             </div>
-            <button onclick="startScraper()">🚀 SCRAPE TO SUPABASE ONLY</button>
+            <button onclick="startSupabaseArchive()" class="btn-supabase">🚀 ARCHIVE TO SUPABASE</button>
         </div>
         
+        <!-- SECTION 2: WORKER QUEUE & REPOSTER (Download, Watermark, Upload to Account) -->
         <div class="card" style="border-top-color: #f59e0b;">
-            <h3>🎥 Add Jobs & Cleaner (Worker Queue)</h3>
-            <p style="font-size:12px; color:#94a3b8; margin-top:0;">Scrapes targets or takes manual IDs, then sends them to workers to download & upload.</p>
-            <div style="display:flex; gap:10px;">
+            <h3>🎬 SECTION 2: Worker Queue & Reposter</h3>
+            <p style="font-size:12px; color:#94a3b8;">Scrape IDs → Add to queue → Download → Watermark (or skip if >40MB on No limit) → Upload to your account</p>
+            <div class="inline-group">
                 <select id="rep_mode" style="width:35%;">
-                    <option value="manual">Manual IDs</option>
-                    <option value="keyword">Keyword Scrape</option>
-                    <option value="username">Username Scrape</option>
+                    <option value="keyword">Keyword</option>
+                    <option value="username">Username</option>
+                    <option value="manual">Manual IDs (line sep)</option>
                 </select>
-                <input id="rep_input" placeholder="Keyword, Username, or Paste IDs..." style="width:40%;">
-                <select id="size_limit" style="width:25%;"><option value="10">10 MB</option><option value="40">40 MB</option><option value="9999">Unlmt.</option></select>
+                <input id="rep_input" placeholder="Keyword, username, or paste IDs/links..." style="width:65%;">
             </div>
-            <button onclick="startReposter()" class="btn-repost">⚙️ SCRAPE & SEND TO QUEUE</button>
-            <hr style="border-color:#334155; margin:15px 0;">
-            <button onclick="runCleaner()" class="btn-red">🧹 RUN GLOBAL DB CLEANER</button>
+            <div class="inline-group">
+                <select id="size_limit" style="width:40%;">
+                    <option value="20">20 MB</option>
+                    <option value="30">30 MB</option>
+                    <option value="40">40 MB</option>
+                    <option value="9999">No limit</option>
+                </select>
+                <button onclick="startReposter()" class="btn-repost" style="width:60%;">⚙️ SCRAPE & ADD TO QUEUE</button>
+            </div>
+            <hr>
+            <div class="inline-group">
+                <button onclick="runCleaner()" class="btn-red" style="width:50%;">🧹 DELETE DUPLICATES FROM ACCOUNT</button>
+                <button onclick="syncUploadedTable()" class="btn-sync" style="width:50%;">🔄 SYNC UPLOADED TABLE</button>
+            </div>
         </div>
     </div>
 
@@ -461,26 +609,40 @@ HTML_TEMPLATE = """
         </div>
         <div id="logs">Loading logs...</div>
     </div>
+
 <script>
-    async function startScraper() {
-        let m = document.getElementById('db_mode').value, q = document.getElementById('db_target').value;
-        if(!q) return alert("Enter target!");
-        await fetch('/api/scrape', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:m, query:q})});
-        document.getElementById('db_target').value = '';
+    async function startSupabaseArchive() {
+        let mode = document.getElementById('arch_mode').value;
+        let target = document.getElementById('arch_target').value.trim();
+        if(!target) return alert("Enter target!");
+        let payload = {mode: mode, target: target};
+        let resp = await fetch('/api/supabase_archive', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        let data = await resp.json();
+        alert(data.message);
+        document.getElementById('arch_target').value = '';
     }
+    
     async function startReposter() {
         let mode = document.getElementById('rep_mode').value;
-        let input = document.getElementById('rep_input').value;
+        let input = document.getElementById('rep_input').value.trim();
         let limit = document.getElementById('size_limit').value;
         if(!input) return alert("Enter target or IDs!");
         await fetch('/api/repost', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:mode, input:input, size_limit: parseInt(limit)})});
         document.getElementById('rep_input').value = '';
     }
+    
     async function runCleaner() {
-        if(confirm("Are you sure? This will map your profile and delete duplicates!")) {
+        if(confirm("Are you sure? This will scan your profile, delete duplicate reels based on thumbnail hashes, and then sync the uploaded table.")) {
             await fetch('/api/cleaner', {method: 'POST'});
         }
     }
+    
+    async function syncUploadedTable() {
+        if(confirm("This will fetch all videos from your profile and update the uploaded_videos table. Proceed?")) {
+            await fetch('/api/sync_uploaded', {method: 'POST'});
+        }
+    }
+    
     async function saveConfig() {
         let payload = {
             my_token: document.getElementById('set_token').value, 
@@ -492,6 +654,7 @@ HTML_TEMPLATE = """
         await fetch('/api/settings', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
         alert("Node Configuration Saved!");
     }
+    
     setInterval(async () => {
         try {
             let r = await fetch('/api/status'); let d = await r.json();
@@ -514,7 +677,8 @@ HTML_TEMPLATE = """
         document.getElementById('set_del').value = d.del_payload || "";
         document.getElementById('set_cookie').value = d.full_cookie || "";
     })();
-</script></body></html>
+</script>
+</body></html>
 """
 
 @app.route('/')
@@ -544,48 +708,108 @@ def api_settings():
     emit_log("Settings updated for this node.", "SYS", "#10b981")
     return jsonify({"status": "ok"})
 
-@app.route('/api/scrape', methods=['POST'])
-def api_scrape():
+# ---------------------------
+#  SECTION 1: Supabase Archive Endpoint
+# ---------------------------
+@app.route('/api/supabase_archive', methods=['POST'])
+def api_supabase_archive():
     data = request.json
-    threading.Thread(target=run_async, args=(async_db_pipeline(data['mode'], data['query'], action="supabase_only"),), daemon=True).start()
-    return jsonify({"status": "started"})
+    mode = data.get('mode')
+    target = data.get('target', '').strip()
+    
+    if not target:
+        return jsonify({"error": "Empty target"}), 400
+    
+    def archive_task():
+        if mode == 'single':
+            # Single ID or link
+            vid = extract_video_id_from_input(target)
+            if vid:
+                insert_into_supabase([vid])
+                emit_log(f"Archived single video {vid} to Supabase", "ARCHIVE", "#8b5cf6")
+            else:
+                emit_log(f"Invalid video ID/link: {target}", "ARCHIVE", "#ef4444")
+        else:
+            # Scrape by keyword or username
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            vids = loop.run_until_complete(async_scrape_ids(mode, target))
+            loop.close()
+            if vids:
+                insert_into_supabase(vids)
+                emit_log(f"Archived {len(vids)} IDs from {mode} '{target}' to Supabase", "ARCHIVE", "#8b5cf6")
+            else:
+                emit_log(f"No IDs found for {mode} '{target}'", "ARCHIVE", "#ef4444")
+    
+    threading.Thread(target=archive_task, daemon=True).start()
+    return jsonify({"message": "Archive task started. Check logs."})
 
+# ---------------------------
+#  SECTION 2: Repost (Queue Addition) Endpoint
+# ---------------------------
 @app.route('/api/repost', methods=['POST'])
 def api_repost():
     data = request.json
     mode = data.get('mode', 'manual')
-    input_val = data['input']
+    input_val = data['input'].strip()
     size_limit = data['size_limit']
 
     def handle_queueing():
         if mode == "manual":
+            # Parse lines or comma separated
             ids = []
-            for line in input_val.strip().split('\n'):
+            for line in input_val.replace(',', '\n').split('\n'):
                 line = line.strip()
                 if not line: continue
-                match = re.search(r'/(?:video/)?([^/?]+)', line)
-                ids.append(match.group(1) if match else line)
-                
+                vid = extract_video_id_from_input(line)
+                if vid:
+                    ids.append(vid)
+                else:
+                    emit_log(f"Could not extract ID from: {line}", "QUEUE", "#ef4444")
+            if not ids:
+                emit_log("No valid IDs found in manual input", "QUEUE", "#ef4444")
+                return
             new_ids = filter_existing_ids(ids)
             skipped = len(ids) - len(new_ids)
             added = sum(1 for vid in new_ids if add_to_neon_queue(vid, size_limit))
             emit_log(f"⚡ Manual Input: Skipped {skipped} duplicates. Added {added} NEW jobs to Global Queue", "NODE", "#f59e0b")
         else:
-            emit_log(f"🔍 Extracting IDs for {mode}: '{input_val}' to add to Worker Queue...", "REPOST", "#f59e0b")
+            emit_log(f"🔍 Scraping {mode}: '{input_val}' to add to Worker Queue...", "REPOST", "#f59e0b")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(async_db_pipeline(mode, input_val, action="queue", size_limit=size_limit))
+            scraped_ids = loop.run_until_complete(async_scrape_ids(mode, input_val))
             loop.close()
-
+            if not scraped_ids:
+                emit_log(f"No IDs found for {mode} '{input_val}'", "QUEUE", "#ef4444")
+                return
+            new_ids = filter_existing_ids(scraped_ids)
+            skipped = len(scraped_ids) - len(new_ids)
+            added = 0
+            for vid in new_ids:
+                if add_to_neon_queue(vid, size_limit):
+                    added += 1
+            emit_log(f"✨ Scrape Done! Found {len(scraped_ids)}. Skipped {skipped} existing queue entries. Added {added} NEW jobs to Global Queue.", "SCRAPE", "#3b82f6")
+    
     threading.Thread(target=handle_queueing, daemon=True).start()
     return jsonify({"status": "queued"})
 
+# ---------------------------
+#  Duplicate Cleaner Endpoint
+# ---------------------------
 @app.route('/api/cleaner', methods=['POST'])
 def api_cleaner():
     threading.Thread(target=native_cleaner_task, daemon=True).start()
     return jsonify({"status": "started"})
 
+# ---------------------------
+#  Sync Uploaded Table Endpoint
+# ---------------------------
+@app.route('/api/sync_uploaded', methods=['POST'])
+def api_sync_uploaded():
+    threading.Thread(target=sync_uploaded_videos_from_profile, daemon=True).start()
+    return jsonify({"status": "sync started"})
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 STARTING V8.5 AUTONOMOUS SWARM NODE on Port {port}...")
+    print(f"🚀 STARTING V9.0 DUAL-MODE SWARM NODE on Port {port}...")
     app.run(host='0.0.0.0', port=port, threaded=True)
