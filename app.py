@@ -14,7 +14,7 @@ app.secret_key = os.environ.get('FLASK_SECRET', 'changeme_production_secret_!@#$
 # ---------------------------
 IST = timezone(timedelta(hours=5, minutes=30))
 def ist_now(): return datetime.now(IST)
-def ist_time_str(): return ist_now().strftime("%I:%M:%S %p")  # 12-hour with AM/PM
+def ist_time_str(): return ist_now().strftime("%I:%M:%S %p")
 
 # ---------------------------
 #  SERVER ID
@@ -23,7 +23,7 @@ SERVER_ID = os.environ.get('SERVER_ID', socket.gethostname() + "_" + str(uuid.uu
 print(f"🖥️ Server ID: {SERVER_ID}")
 
 # ---------------------------
-#  ENVIRONMENT VARIABLES
+#  ENVIRONMENT VARIABLES (with hardcoded fallbacks)
 # ---------------------------
 NEON_DB_URL = os.environ.get('NEON_DB_URL', "postgresql://neondb_owner:npg_Rh0xIbmdFe5u@ep-quiet-block-a12aatzr-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
 SUPABASE_URL = os.environ.get('SUPABASE_URL', "https://cnkbewgpguyojiebztbs.supabase.co/rest/v1/reels")
@@ -54,7 +54,7 @@ def check_ffmpeg():
 FFMPEG_AVAILABLE = check_ffmpeg()
 
 # ---------------------------
-#  CROSS‑PROCESS STATE
+#  CROSS‑PROCESS STATE (file‑based)
 # ---------------------------
 def read_state():
     try:
@@ -113,14 +113,12 @@ def fix_fast_mode_column():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Check column type
             cur.execute("""
                 SELECT data_type FROM information_schema.columns 
                 WHERE table_name='repost_queue' AND column_name='fast_mode';
             """)
             row = cur.fetchone()
             if row and row[0] != 'boolean':
-                # Convert text to boolean: 'true'/'false' or 1/0
                 cur.execute("ALTER TABLE repost_queue ALTER COLUMN fast_mode TYPE BOOLEAN USING (fast_mode::boolean);")
                 conn.commit()
                 emit_log("Fixed fast_mode column type to BOOLEAN", "DB", "#10b981")
@@ -155,7 +153,6 @@ def init_neon_db():
                     fast_mode BOOLEAN DEFAULT FALSE
                 );
             """)
-            # Add missing columns if any
             for col, dtype in [('server_id','TEXT'), ('source_type','TEXT'), ('source_value','TEXT')]:
                 try:
                     cur.execute(f"ALTER TABLE repost_queue ADD COLUMN IF NOT EXISTS {col} {dtype};")
@@ -242,7 +239,7 @@ def get_next_job():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Fast mode first (now boolean works)
+            # Fast mode first
             cur.execute("""
                 UPDATE repost_queue SET status = 'doing', updated_at = NOW()
                 WHERE id = (
@@ -400,7 +397,7 @@ def run_exclusive(func):
     return wrapper
 
 # ---------------------------
-#  WORKER ENGINE
+#  WORKER ENGINE (with detailed step logs)
 # ---------------------------
 def reposter_worker():
     emit_log(f"👷 Worker online (Server: {SERVER_ID})", "WORKER", "#f59e0b")
@@ -428,17 +425,21 @@ def process_video_job(job):
     h_media = get_headers()
     try:
         domain = conf['main_domain']
-        # Thumbnail hash check
+        emit_log(f"🔍 Checking thumbnail for {video_id[:8]}...", "REPOST", "#0ea5e9")
         thumb_url = f"https://{domain}/media/images/{video_id}.jpg"
         thumb_resp = requests.get(thumb_url, headers=h_media, timeout=8)
         thumb_hash = None
         if thumb_resp.status_code == 200:
             thumb_hash = hashlib.md5(thumb_resp.content).hexdigest()
+            emit_log(f"📸 Thumbnail hash: {thumb_hash[:8]}...", "REPOST", "#0ea5e9")
             if is_video_already_uploaded(thumb_hash):
-                emit_log(f"⏭️ Duplicate hash: {video_id[:8]}", "REPOST", "#f43f5e")
+                emit_log(f"⏭️ Duplicate hash: {video_id[:8]} already uploaded", "REPOST", "#f43f5e")
                 update_job_status(job["id"], 'completed', "Duplicate hash")
                 return
-        # Metadata
+        else:
+            emit_log(f"⚠️ Could not fetch thumbnail, proceeding anyway", "REPOST", "#f59e0b")
+        # Fetch metadata
+        emit_log(f"📝 Fetching metadata for {video_id[:8]}...", "REPOST", "#0ea5e9")
         title = f"Viral Video {video_id[:6]}"
         desc = "#trending #viral #reels"
         category_tag = "18+"
@@ -450,28 +451,32 @@ def process_video_job(job):
             if vid_data.get("description"): desc = vid_data["description"]
             if vid_data.get("tag"): category_tag = vid_data["tag"]
             if vid_data.get("username"): original_username = vid_data["username"]
-        except: pass
+            emit_log(f"📝 Title: {title[:50]}...", "REPOST", "#0ea5e9")
+        except Exception as e:
+            emit_log(f"Metadata fetch failed: {e}", "REPOST", "#ef4444", True)
         # Self-loop & blacklist
         if original_username and original_username.lower() == conf['my_user'].lower():
-            emit_log(f"⏭️ Self-loop: {video_id[:8]}", "REPOST", "#f43f5e")
+            emit_log(f"⏭️ Self-loop: belongs to {conf['my_user']}", "REPOST", "#f43f5e")
             update_job_status(job["id"], 'completed', "Self-loop")
             return
         bl_words = [w.strip().lower() for w in conf.get("blacklist", "").split(",") if w.strip()]
         if any(w in f"{title} {desc} {category_tag}".lower() for w in bl_words):
-            emit_log(f"🛑 Blacklisted: {video_id[:8]}", "REPOST", "#ef4444")
+            emit_log(f"🛑 Blacklisted keyword detected", "REPOST", "#ef4444")
             update_job_status(job["id"], 'failed', "Blacklisted")
             return
-        # Size
+        # Size check
         d_url = f"https://{domain}/media/videos/{video_id}.mp4"
         size_mb = 0
         with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
             if r_size.status_code == 200 and 'content-length' in r_size.headers:
                 size_mb = round(int(r_size.headers['content-length']) / (1024 * 1024), 2)
+                emit_log(f"📦 Video size: {size_mb} MB", "REPOST", "#0ea5e9")
         if size_limit != 9999 and size_mb > size_limit:
             emit_log(f"⏭️ Too large: {size_mb}MB > {size_limit}MB", "REPOST", "#f43f5e")
             update_job_status(job["id"], 'failed', f"Size {size_mb}MB > {size_limit}MB")
             return
-        emit_log(f"📥 Downloading {video_id[:8]} ({size_mb}MB)", "REPOST", "#0ea5e9")
+        # Download
+        emit_log(f"📥 Downloading {video_id[:8]}...", "REPOST", "#0ea5e9")
         safe_label = re.sub(r'[^a-zA-Z0-9]', '_', video_id)[-12:]
         raw_file = os.path.join(VIDEO_DIR, f"raw_{safe_label}.mp4")
         watermarked_file = os.path.join(VIDEO_DIR, f"video_{safe_label}.mp4")
@@ -480,20 +485,24 @@ def process_video_job(job):
             if s_res.status_code != 200: raise Exception("404 Not Found")
             with open(raw_file, 'wb') as f:
                 for chunk in s_res.iter_content(8192): f.write(chunk)
+        emit_log(f"✅ Downloaded {raw_file}", "REPOST", "#10b981")
         file_to_upload = raw_file
         # Watermark decision
         if size_limit == 9999 and size_mb > 40:
-            emit_log(f"⚡ No watermark (>40MB)", "REPOST", "#d946ef")
+            emit_log(f"⚡ No watermark (size >40MB & no limit)", "REPOST", "#d946ef")
             subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
+            emit_log(f"📸 Preview generated", "REPOST", "#0ea5e9")
         elif not FFMPEG_AVAILABLE:
-            emit_log(f"⚠️ FFmpeg missing → raw upload", "REPOST", "#f59e0b")
+            emit_log(f"⚠️ FFmpeg missing → uploading raw video", "REPOST", "#f59e0b")
         else:
-            emit_log(f"👻 Watermarking...", "REPOST", "#d946ef")
+            emit_log(f"👻 Applying ghost watermark...", "REPOST", "#d946ef")
             vf = "hflip,eq=brightness=0.02:saturation=1.05,scale='min(720,iw)':-2,drawtext=text='telugu stuffs':fontcolor=yellow@0.6:fontsize=24:x=(w-text_w)/2:y=h-th-14"
             subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
             subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
             file_to_upload = watermarked_file
-        emit_log(f"📤 Uploading...", "REPOST", "#0ea5e9")
+            emit_log(f"✅ Watermark applied", "REPOST", "#10b981")
+        # Upload
+        emit_log(f"📤 Uploading to {conf['upload_domain']}...", "REPOST", "#0ea5e9")
         base = ".".join(conf['main_domain'].split('.')[-2:])
         with open(file_to_upload, 'rb') as f:
             up = requests.post(
@@ -512,11 +521,15 @@ def process_video_job(job):
         else:
             raise Exception(f"Upload failed: {up.status_code} | {up.text[:200]}")
     except Exception as e:
-        emit_log(f"🔥 Error: {e}", "REPOST", "#ef4444", True)
+        emit_log(f"🔥 Error processing {video_id}: {e}", "REPOST", "#ef4444", True)
         update_job_status(job["id"], 'failed', str(e))
     finally:
         for f in [raw_file, watermarked_file, preview_file]:
-            if f and os.path.exists(f): os.remove(f)
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                    emit_log(f"🗑️ Deleted temp file: {os.path.basename(f)}", "REPOST", "#64748b")
+                except: pass
 
 # ---------------------------
 #  UPLOADED TABLE HELPERS
@@ -541,7 +554,7 @@ def mark_video_uploaded(thumbnail_hash, account_video_id, original_source_id):
     finally: return_db_connection(conn)
 
 # ---------------------------
-#  CLEANER & SYNC
+#  CLEANER & SYNC (with progress logs)
 # ---------------------------
 @run_exclusive
 def native_cleaner_task():
@@ -557,12 +570,14 @@ def native_cleaner_task():
     page, empty_pages = 0, 0
     headers = get_headers()
     session = requests.Session()
+    emit_log("📄 Fetching profile videos...", "CLEANER", "#06b6d4")
     while empty_pages < 2 and page < 80:
         try:
             res = session.post(f"https://{domain}/profile/{username}/videos/latest", headers=headers, json={"page": page}, timeout=15)
             vids = re.findall(r'"videoId":"([^"]+)"', res.text)
             if not vids: empty_pages += 1
             else: empty_pages = 0; all_videos.extend(vids)
+            emit_log(f"   Page {page}: found {len(vids)} videos (total {len(all_videos)})", "CLEANER", "#64748b")
             page += 1
             time.sleep(0.5)
         except Exception as e:
@@ -570,7 +585,7 @@ def native_cleaner_task():
             break
     all_videos = list(dict.fromkeys(all_videos))
     all_videos.reverse()
-    emit_log(f"Found {len(all_videos)} videos. Hashing...", "CLEANER", "#06b6d4")
+    emit_log(f"📊 Total unique videos in profile: {len(all_videos)}", "CLEANER", "#06b6d4")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -578,7 +593,9 @@ def native_cleaner_task():
         known_hashes = {row[0]: row[1] for row in cur.fetchall()}
         seen_hashes = {}
         deleted = 0
-        for vid in all_videos:
+        total = len(all_videos)
+        for idx, vid in enumerate(all_videos, 1):
+            emit_log(f"🔍 [{idx}/{total}] Processing {vid[:8]}...", "CLEANER", "#06b6d4")
             h = known_hashes.get(vid)
             if not h:
                 try:
@@ -588,18 +605,29 @@ def native_cleaner_task():
                         cur.execute("INSERT INTO image_hashes (vid, hash) VALUES (%s, %s) ON CONFLICT DO NOTHING", (vid, h))
                         conn.commit()
                         known_hashes[vid] = h
-                    else: continue
-                except: continue
+                        emit_log(f"   Hash generated: {h[:8]}", "CLEANER", "#64748b")
+                    else:
+                        emit_log(f"   ⚠️ No thumbnail, skipping", "CLEANER", "#f59e0b")
+                        continue
+                except Exception as e:
+                    emit_log(f"   ⚠️ Hash error: {e}", "CLEANER", "#f59e0b")
+                    continue
             if h in seen_hashes:
-                emit_log(f"Duplicate: {vid[:8]}", "CLEANER", "#f43f5e")
+                emit_log(f"🚨 DUPLICATE: {vid[:8]} matches {seen_hashes[h][:8]} → deleting", "CLEANER", "#f43f5e")
                 try:
                     del_res = session.post(f"https://{domain}/uservideo/delete/{vid}", json={"username": payload}, headers=headers, timeout=10)
-                    if del_res.status_code == 200: deleted += 1
-                except: pass
+                    if del_res.status_code == 200:
+                        deleted += 1
+                        emit_log(f"   ✅ Deleted {vid[:8]}", "CLEANER", "#10b981")
+                    else:
+                        emit_log(f"   ❌ Delete failed: {del_res.status_code}", "CLEANER", "#ef4444")
+                except Exception as e:
+                    emit_log(f"   ❌ Delete error: {e}", "CLEANER", "#ef4444", True)
                 time.sleep(1.2)
             else:
                 seen_hashes[h] = vid
-        emit_log(f"Cleaner done. Deleted {deleted} duplicates.", "CLEANER", "#10b981")
+                emit_log(f"   ✅ New hash recorded", "CLEANER", "#10b981")
+        emit_log(f"✨ CLEANER FINISHED: Deleted {deleted} duplicate videos.", "CLEANER", "#10b981")
     except Exception as e:
         emit_log(f"Cleaner DB error: {e}", "CLEANER", "#ef4444", True)
     finally:
@@ -612,7 +640,7 @@ def sync_uploaded_videos_from_profile():
     domain = conf.get("main_domain")
     username = conf.get("my_user")
     headers = get_headers()
-    emit_log("🔄 Syncing uploaded videos table", "CLEANER", "#06b6d4")
+    emit_log("🔄 Syncing uploaded videos table with profile...", "CLEANER", "#06b6d4")
     all_videos = []
     page, empty = 0, 0
     session = requests.Session()
@@ -622,27 +650,34 @@ def sync_uploaded_videos_from_profile():
             vids = re.findall(r'"videoId":"([^"]+)"', res.text)
             if not vids: empty += 1
             else: empty = 0; all_videos.extend(vids)
+            emit_log(f"   Page {page}: {len(vids)} videos (total {len(all_videos)})", "CLEANER", "#64748b")
             page += 1
             time.sleep(0.5)
         except: break
     all_videos = list(dict.fromkeys(all_videos))
+    emit_log(f"📊 Found {len(all_videos)} videos in profile", "CLEANER", "#06b6d4")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        for vid in all_videos:
+        for idx, vid in enumerate(all_videos, 1):
+            emit_log(f"🔍 [{idx}/{len(all_videos)}] Syncing {vid[:8]}...", "CLEANER", "#06b6d4")
             try:
                 img = session.get(f"https://{domain}/media/images/{vid}.jpg", stream=True, timeout=8)
                 if img.status_code == 200:
                     h = hashlib.md5(img.content).hexdigest()
                     cur.execute("INSERT INTO uploaded_videos (hash, video_id, original_source_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                                 (h, vid, vid))
-            except: continue
+                    emit_log(f"   ✅ Recorded hash {h[:8]}", "CLEANER", "#10b981")
+                else:
+                    emit_log(f"   ⚠️ No thumbnail", "CLEANER", "#f59e0b")
+            except Exception as e:
+                emit_log(f"   ❌ Error: {e}", "CLEANER", "#ef4444")
         conn.commit()
     except Exception as e:
-        emit_log(f"Sync error: {e}", "CLEANER", "#ef4444", True)
+        emit_log(f"Sync DB error: {e}", "CLEANER", "#ef4444", True)
     finally:
         return_db_connection(conn)
-    emit_log(f"Sync done. {len(all_videos)} videos recorded.", "CLEANER", "#10b981")
+    emit_log(f"✅ SYNC COMPLETE: {len(all_videos)} videos recorded.", "CLEANER", "#10b981")
 
 # ---------------------------
 #  SUPABASE HELPERS
@@ -714,9 +749,13 @@ def api_supabase_archive():
             if vid: insert_into_supabase([vid])
             else: emit_log(f"Invalid ID: {target}", "ARCHIVE", "#ef4444", True)
         else:
+            emit_log(f"Scraping {mode} '{target}' for Supabase archive...", "ARCHIVE", "#8b5cf6")
             vids = run_coroutine(async_scrape_ids(mode, target))
-            if vids: insert_into_supabase(vids)
-            else: emit_log(f"No IDs found for {mode}", "ARCHIVE", "#ef4444", True)
+            if vids:
+                emit_log(f"Found {len(vids)} IDs, archiving...", "ARCHIVE", "#8b5cf6")
+                insert_into_supabase(vids)
+            else:
+                emit_log(f"No IDs found for {mode} '{target}'", "ARCHIVE", "#ef4444", True)
     threading.Thread(target=task, daemon=True).start()
     return jsonify({"message": "Archive started"})
 
@@ -745,23 +784,26 @@ def api_repost():
                 if not ids:
                     emit_log("No valid IDs", "QUEUE", "#ef4444", True)
                     return
+                emit_log(f"Manual: adding {len(ids)} IDs to queue (fast={fast})", "QUEUE", "#f59e0b")
                 added = 0
                 for vid in ids:
                     if add_to_neon_queue(vid, size_limit, "manual", "user_input", fast):
                         added += 1
-                emit_log(f"Manual: added {added} jobs (fast={fast})", "QUEUE", "#f59e0b")
+                emit_log(f"Manual: added {added} jobs", "QUEUE", "#f59e0b")
             else:
-                emit_log(f"Scraping {mode}: '{target}' (fast={fast})", "SCRAPE", "#3b82f6")
+                emit_log(f"Scraping {mode} '{target}' for queue (fast={fast})...", "SCRAPE", "#3b82f6")
                 scraped_ids = run_coroutine(async_scrape_ids(mode, target))
                 if not scraped_ids:
                     emit_log(f"No IDs found", "SCRAPE", "#ef4444", True)
                     return
+                emit_log(f"Found {len(scraped_ids)} IDs, filtering existing...", "SCRAPE", "#3b82f6")
                 new_ids = filter_existing_ids(scraped_ids)
+                emit_log(f"{len(new_ids)} new IDs to add", "SCRAPE", "#3b82f6")
                 added = 0
                 for vid in new_ids:
                     if add_to_neon_queue(vid, size_limit, mode, target, fast):
                         added += 1
-                emit_log(f"Scraped {len(scraped_ids)} → {added} new jobs (fast={fast})", "SCRAPE", "#3b82f6")
+                emit_log(f"Scrape done: added {added} jobs to queue", "SCRAPE", "#3b82f6")
         finally:
             update_status(current_op=None)
             operation_lock.release()
@@ -781,11 +823,11 @@ def api_sync_uploaded():
     return jsonify({"status": "started"})
 
 # ---------------------------
-#  UI TEMPLATES (Mobile Responsive)
+#  UI TEMPLATES (Mobile Responsive with styled inputs)
 # ---------------------------
 LOGIN_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes"><title>Swarm Login</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}.login-card{background:rgba(30,41,59,0.9);backdrop-filter:blur(12px);padding:32px 24px;border-radius:28px;width:100%;max-width:380px;text-align:center;border:1px solid rgba(255,255,255,0.1);box-shadow:0 20px 35px -10px black}h2{color:#f8fafc;margin-bottom:24px;font-size:1.8rem}input{width:100%;padding:14px;margin:12px 0;border-radius:16px;border:none;background:#0f172a;color:white;font-size:1rem}button{width:100%;padding:14px;background:#3b82f6;border:none;border-radius:40px;color:white;font-weight:600;font-size:1rem;cursor:pointer;transition:0.2s}button:hover{background:#2563eb;transform:scale(0.98)}.error{color:#ef4444;margin-top:12px}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}.login-card{background:rgba(30,41,59,0.9);backdrop-filter:blur(12px);padding:32px 24px;border-radius:28px;width:100%;max-width:380px;text-align:center;border:1px solid rgba(255,255,255,0.1);box-shadow:0 20px 35px -10px black}h2{color:#f8fafc;margin-bottom:24px;font-size:1.8rem}input{width:100%;padding:14px;margin:12px 0;border-radius:16px;border:none;background:#0f172a;color:white;font-size:1rem;border:1px solid #334155;transition:0.2s}input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.2)}button{width:100%;padding:14px;background:#3b82f6;border:none;border-radius:40px;color:white;font-weight:600;font-size:1rem;cursor:pointer;transition:0.2s}button:hover{background:#2563eb;transform:scale(0.98)}.error{color:#ef4444;margin-top:12px}
 </style></head><body><div class="login-card"><h2>🔐 Swarm Node</h2><form method="POST"><input type="password" name="password" placeholder="Enter password" autofocus><button type="submit">Authenticate</button>{% if error %}<div class="error">{{ error }}</div>{% endif %}</form></div></body></html>
 """
 
@@ -795,7 +837,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes, viewport-fit=cover">
-    <title>V14.0 Swarm Node | Mobile Ready</title>
+    <title>V15.0 Swarm Node | Ultimate</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1120; color: #f1f5f9; padding: 16px; }
@@ -809,12 +851,45 @@ HTML_TEMPLATE = """
         .status-item { background: #0f172a; padding: 5px 12px; border-radius: 40px; font-size: 0.75rem; display: flex; align-items: baseline; gap: 6px; }
         .status-label { color: #94a3b8; text-transform: uppercase; font-size: 0.65rem; }
         .status-value { font-weight: 700; font-size: 0.85rem; }
-        .card { background: #1e293b; border-radius: 24px; padding: 20px; margin-bottom: 20px; border-top: 3px solid #3b82f6; }
+        .card { background: #1e293b; border-radius: 24px; padding: 20px; margin-bottom: 20px; border-top: 3px solid #3b82f6; transition: transform 0.2s; }
+        .card:hover { transform: translateY(-2px); }
         .card h2 { font-size: 1.3rem; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
         .input-group { display: flex; flex-direction: column; gap: 12px; margin: 16px 0; }
         .input-row { display: flex; flex-wrap: wrap; gap: 10px; }
-        .input-row select, .input-row input { flex: 1; padding: 12px; border-radius: 16px; border: 1px solid #334155; background: #0f172a; color: white; font-size: 0.9rem; }
-        button { background: #3b82f6; padding: 12px 18px; border: none; border-radius: 40px; color: white; font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: 0.2s; width: 100%; }
+        input, select, textarea {
+            width: 100%;
+            padding: 12px 16px;
+            border-radius: 16px;
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: #f1f5f9;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+            outline: none;
+        }
+        input:focus, select:focus, textarea:focus {
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.2);
+        }
+        select {
+            appearance: none;
+            background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>");
+            background-repeat: no-repeat;
+            background-position: right 16px center;
+            background-size: 16px;
+        }
+        button {
+            background: #3b82f6;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 40px;
+            color: white;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: 0.2s;
+            width: 100%;
+        }
         button:active { transform: scale(0.97); }
         .btn-purple { background: #8b5cf6; }
         .btn-orange { background: #f59e0b; }
@@ -823,11 +898,11 @@ HTML_TEMPLATE = """
         .fast-toggle { background: #334155; border: 1px solid #475569; }
         .fast-toggle.active { background: #f59e0b; color: #0f172a; }
         hr { border-color: #334155; margin: 16px 0; }
-        .logs-panel { background: #0f172a; border-radius: 20px; padding: 16px; }
-        .logs-header { display: flex; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
-        #logs { height: 320px; overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.5; background: #020617; padding: 12px; border-radius: 16px; }
+        .logs-panel { background: #0f172a; border-radius: 20px; padding: 16px; margin-top: 20px; }
+        .logs-header { display: flex; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; align-items: center; }
+        #logs { height: 320px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.5; background: #020617; padding: 12px; border-radius: 16px; }
         .settings-grid { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
-        .settings-grid input { padding: 12px; border-radius: 16px; background: #0f172a; border: 1px solid #334155; color: white; }
+        .settings-grid input { width: 100%; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; padding: 16px; }
         .modal-content { background: #1e293b; border-radius: 28px; padding: 20px; width: 100%; max-width: 500px; max-height: 80vh; overflow-y: auto; }
         .modal-content h3 { margin-bottom: 16px; font-size: 1.3rem; }
@@ -838,12 +913,13 @@ HTML_TEMPLATE = """
         .close-modal { float: right; font-size: 28px; cursor: pointer; background: none; border: none; color: white; line-height: 1; }
         .toast { position: fixed; bottom: 20px; left: 16px; right: 16px; background: #1e293b; border-left: 4px solid #10b981; padding: 12px 16px; border-radius: 40px; z-index: 1100; font-size: 0.8rem; backdrop-filter: blur(8px); text-align: center; }
         @media (min-width: 768px) { .container { max-width: 800px; } .input-row { flex-direction: row; } .status-bar { flex-wrap: nowrap; } button { width: auto; } .toast { left: auto; right: 20px; max-width: 350px; } }
+        .log-entry { margin-bottom: 4px; word-break: break-word; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <div class="top-bar"><h1>🐝 V14.0 SWARM NODE</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
+        <div class="top-bar"><h1>🐝 V15.0 ULTIMATE SWARM</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
         <div class="badge">🖥️ {{ server_id }}</div>
     </div>
     <div class="status-bar">
@@ -871,7 +947,7 @@ HTML_TEMPLATE = """
         </div>
         <hr>
         <div class="input-row"><button onclick="runCleaner()" class="btn-red">🧹 Delete Duplicates</button><button onclick="syncUploadedTable()" class="btn-green">🔄 Sync Uploaded</button></div>
-        <div class="input-row" style="margin-top:12px"><button id="showSourcesBtn" style="background:#334155;">📊 Show Queue Sources</button><button id="settingsBtn" style="background:#334155;">⚙️ Settings</button></div>
+        <div class="input-row" style="margin-top:12px"><button id="showSourcesBtn" style="background:#334155;">📊 Queue Sources</button><button id="settingsBtn" style="background:#334155;">⚙️ Settings</button></div>
     </div>
     <div class="logs-panel">
         <div class="logs-header"><span>📋 Live Logs (IST 12hr)</span><button onclick="clearLogs()" style="background:#475569; padding:6px 12px; width:auto;">Clear</button></div>
@@ -893,12 +969,12 @@ HTML_TEMPLATE = """
     async function saveConfig(){let payload={my_token:document.getElementById('set_token').value,my_user:document.getElementById('set_user').value,blacklist:document.getElementById('set_bl').value,del_payload:document.getElementById('set_del').value,full_cookie:document.getElementById('set_cookie').value};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});showToast("Settings saved");}
     async function clearLogs(){await fetch('/api/clear_logs',{method:'POST'});showToast("Logs cleared");}
     let srcModal=document.getElementById('sourceModal'),setModal=document.getElementById('settingsModal');
-    document.getElementById('showSourcesBtn').onclick=async()=>{let r=await fetch('/api/status');let d=await r.json();let grouped=d.sources_grouped||{};let html='';for(let [type,items] of Object.entries(grouped)){html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source</th><th>Count</th></tr>`;items.forEach(i=>{html+=`<tr><td>${escapeHtml(i.value)}</td><td>${i.count}</td></tr>`;});html+=`</table></div>`;}if(!Object.keys(grouped).length)html='<p>No pending jobs.</p>';document.getElementById('sourceTableBody').innerHTML=html;srcModal.style.display='flex';};
+    document.getElementById('showSourcesBtn').onclick=async()=>{let r=await fetch('/api/status');let d=await r.json();let grouped=d.sources_grouped||{};let html='';for(let [type,items] of Object.entries(grouped)){html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source</th><th>Count</th></tr>`;items.forEach(i=>{html+=`<tr><td>${escapeHtml(i.value)}</td><td>${i.count}</td>`;});html+=`</table></div>`;}if(!Object.keys(grouped).length)html='<p>No pending jobs.</p>';document.getElementById('sourceTableBody').innerHTML=html;srcModal.style.display='flex';};
     function escapeHtml(s){return s.replace(/[&<>]/g,function(m){if(m==='&')return '&amp;';if(m==='<')return '&lt;';if(m==='>')return '&gt;';return m;});}
     document.getElementById('settingsBtn').onclick=async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';setModal.style.display='flex';};
     document.querySelectorAll('.close-modal').forEach(btn=>btn.onclick=()=>{srcModal.style.display='none';setModal.style.display='none';});
     window.onclick=e=>{if(e.target==srcModal)srcModal.style.display='none';if(e.target==setModal)setModal.style.display='none';};
-    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-repost').innerText=d.reposter;document.getElementById('s-q').innerText=d.queue_size;document.getElementById('current-op').innerText=d.current_operation||'None';let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}`).join('<br>');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
+    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-repost').innerText=d.reposter;document.getElementById('s-q').innerText=d.queue_size;document.getElementById('current-op').innerText=d.current_operation||'None';let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<div class="log-entry"><span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}</div>`).join('');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
     (async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';})();
 </script>
 </body>
@@ -912,6 +988,6 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 V14.0 Swarm Node on port {port} | Server: {SERVER_ID}")
+    print(f"🚀 V15.0 Ultimate Swarm Node on port {port} | Server: {SERVER_ID}")
     print(f"🔐 Admin password: {ADMIN_PASSWORD}")
     app.run(host='0.0.0.0', port=port, threaded=True)
