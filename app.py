@@ -72,11 +72,14 @@ def write_state(data):
         fcntl.flock(f, fcntl.LOCK_UN)
 def emit_log(msg, category="SYS", color="#10b981", is_error=False):
     t = ist_time_str()
+    # Print full message to console (no truncation)
     print(f"[{t}] [{category}] {msg}")
-    if is_error: print(traceback.format_exc())
+    if is_error:
+        print(traceback.format_exc())
     state = read_state()
     state["logs"].append({"time": t, "category": category, "message": msg, "color": color, "is_error": is_error})
-    if len(state["logs"]) > 200: state["logs"] = state["logs"][-200:]
+    if len(state["logs"]) > 200:
+        state["logs"] = state["logs"][-200:]
     write_state(state)
 def update_status(scraper=None, reposter=None, queue_size=None, current_op=None):
     state = read_state()
@@ -113,7 +116,6 @@ def fix_fast_mode_column():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Check column type
             cur.execute("""
                 SELECT data_type FROM information_schema.columns 
                 WHERE table_name='repost_queue' AND column_name='fast_mode';
@@ -126,7 +128,6 @@ def fix_fast_mode_column():
             elif not row:
                 cur.execute("ALTER TABLE repost_queue ADD COLUMN fast_mode BOOLEAN DEFAULT FALSE;")
                 conn.commit()
-            # Set any NULLs to FALSE
             cur.execute("UPDATE repost_queue SET fast_mode = FALSE WHERE fast_mode IS NULL;")
             conn.commit()
     except Exception as e:
@@ -219,6 +220,13 @@ def logout():
     return redirect(url_for('login'))
 
 # ---------------------------
+#  HEALTH CHECK FOR UPTIME ROBOT
+# ---------------------------
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "server_id": SERVER_ID, "time": ist_time_str()}), 200
+
+# ---------------------------
 #  QUEUE HELPERS
 # ---------------------------
 def add_to_neon_queue(video_id, size_limit, source_type, source_value, fast=False):
@@ -244,7 +252,6 @@ def get_next_job():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # First try fast mode jobs
             cur.execute("""
                 UPDATE repost_queue SET status = 'doing', updated_at = NOW()
                 WHERE id = (
@@ -255,7 +262,6 @@ def get_next_job():
             """)
             job = cur.fetchone()
             if not job:
-                # Then normal jobs
                 cur.execute("""
                     UPDATE repost_queue SET status = 'doing', updated_at = NOW()
                     WHERE id = (
@@ -270,10 +276,9 @@ def get_next_job():
             emit_log(f"🎯 Got job: {job[1][:8]} (fast={job[3]})", "WORKER", "#f59e0b")
             return {"id": job[0], "video_id": job[1], "size_limit": job[2], "fast_mode": job[3]}
         else:
-            # No job, log occasionally
             state = read_state()
             if state.get("queue_size", 0) > 0:
-                emit_log(f"⚠️ Queue has {state['queue_size']} jobs but none were acquired (possibly locked by other worker)", "WORKER", "#f59e0b")
+                emit_log(f"⚠️ Queue has {state['queue_size']} jobs but none acquired (locked by another worker)", "WORKER", "#f59e0b")
     except Exception as e:
         emit_log(f"get_next_job error: {e}", "WORKER", "#ef4444", True)
     finally:
@@ -415,7 +420,6 @@ def reposter_worker():
     emit_log(f"👷 Worker online (Server: {SERVER_ID})", "WORKER", "#f59e0b")
     while True:
         try:
-            # Update queue size in status
             qsize = get_queue_size()
             update_status(queue_size=qsize)
             job = get_next_job()
@@ -732,6 +736,7 @@ def clear_logs():
     state = read_state()
     state["logs"] = []
     write_state(state)
+    emit_log("Logs cleared by user", "SYS", "#64748b")
     return jsonify({"status": "ok"})
 
 @app.route('/api/settings', methods=['GET', 'POST'])
@@ -835,7 +840,6 @@ def api_sync_uploaded():
 @app.route('/api/force_process', methods=['POST'])
 @login_required
 def force_process():
-    """Force worker to run one cycle immediately (for debugging)"""
     def force():
         emit_log("Manual force process triggered", "WORKER", "#f59e0b")
         job = get_next_job()
@@ -861,7 +865,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes, viewport-fit=cover">
-    <title>V16.0 Swarm Node | Fixed Worker</title>
+    <title>V17.0 Swarm Node | Optimized</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1120; color: #f1f5f9; padding: 16px; }
@@ -943,7 +947,7 @@ HTML_TEMPLATE = """
 <body>
 <div class="container">
     <div class="header">
-        <div class="top-bar"><h1>🐝 V16.0 ULTIMATE SWARM</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
+        <div class="top-bar"><h1>🐝 V17.0 OPTIMIZED SWARM</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
         <div class="badge">🖥️ {{ server_id }}</div>
     </div>
     <div class="status-bar">
@@ -973,7 +977,7 @@ HTML_TEMPLATE = """
         <div class="input-row"><button onclick="runCleaner()" class="btn-red">🧹 Delete Duplicates</button><button onclick="syncUploadedTable()" class="btn-green">🔄 Sync Uploaded</button></div>
         <div class="input-row" style="margin-top:12px">
             <button id="showSourcesBtn" style="background:#334155;">📊 Queue Sources</button>
-            <button id="forceProcessBtn" style="background:#f59e0b;">⚡ Force Process One</button>
+            <button id="forceProcessBtn" style="background:#f59e0b;">⚡ Force Process</button>
             <button id="settingsBtn" style="background:#334155;">⚙️ Settings</button>
         </div>
     </div>
@@ -997,13 +1001,13 @@ HTML_TEMPLATE = """
     async function saveConfig(){let payload={my_token:document.getElementById('set_token').value,my_user:document.getElementById('set_user').value,blacklist:document.getElementById('set_bl').value,del_payload:document.getElementById('set_del').value,full_cookie:document.getElementById('set_cookie').value};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});showToast("Settings saved");}
     async function clearLogs(){await fetch('/api/clear_logs',{method:'POST'});showToast("Logs cleared");}
     let srcModal=document.getElementById('sourceModal'),setModal=document.getElementById('settingsModal');
-    document.getElementById('showSourcesBtn').onclick=async()=>{let r=await fetch('/api/status');let d=await r.json();let grouped=d.sources_grouped||{};let html='';for(let [type,items] of Object.entries(grouped)){html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source</th><th>Count</th></tr>`;items.forEach(i=>{html+=`<tr><td>${escapeHtml(i.value)}</td><td>${i.count}</td>`;});html+=`</table></div>`;}if(!Object.keys(grouped).length)html='<p>No pending jobs.</p>';document.getElementById('sourceTableBody').innerHTML=html;srcModal.style.display='flex';};
+    document.getElementById('showSourcesBtn').onclick=()=>{let grouped=window.cachedSources||{};let html='';for(let [type,items] of Object.entries(grouped)){html+=`<div class="source-group"><h4>📁 ${type.toUpperCase()}</h4><table class="source-table"><tr><th>Source</th><th>Count</th></tr>`;items.forEach(i=>{html+=`<tr><td>${escapeHtml(i.value)}</td><td>${i.count}</td>`;});html+=`</table></div>`;}if(!Object.keys(grouped).length)html='<p>No pending jobs.</p>';document.getElementById('sourceTableBody').innerHTML=html;srcModal.style.display='flex';};
     function escapeHtml(s){return s.replace(/[&<>]/g,function(m){if(m==='&')return '&amp;';if(m==='<')return '&lt;';if(m==='>')return '&gt;';return m;});}
     document.getElementById('settingsBtn').onclick=async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';setModal.style.display='flex';};
     document.getElementById('forceProcessBtn').onclick=async()=>{await fetch('/api/force_process',{method:'POST'});showToast("Force process triggered");};
     document.querySelectorAll('.close-modal').forEach(btn=>btn.onclick=()=>{srcModal.style.display='none';setModal.style.display='none';});
     window.onclick=e=>{if(e.target==srcModal)srcModal.style.display='none';if(e.target==setModal)setModal.style.display='none';};
-    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-repost').innerText=d.reposter;document.getElementById('s-q').innerText=d.queue_size;document.getElementById('current-op').innerText=d.current_operation||'None';let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<div class="log-entry"><span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}</div>`).join('');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
+    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-repost').innerText=d.reposter;document.getElementById('s-q').innerText=d.queue_size;document.getElementById('current-op').innerText=d.current_operation||'None';window.cachedSources=d.sources_grouped||{};let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<div class="log-entry"><span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}</div>`).join('');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
     (async()=>{let r=await fetch('/api/settings');let d=await r.json();document.getElementById('set_token').value=d.my_token||'';document.getElementById('set_user').value=d.my_user||'';document.getElementById('set_bl').value=d.blacklist||'';document.getElementById('set_del').value=d.del_payload||'';document.getElementById('set_cookie').value=d.full_cookie||'';})();
 </script>
 </body>
@@ -1017,6 +1021,7 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 V16.0 Ultimate Swarm Node on port {port} | Server: {SERVER_ID}")
+    print(f"🚀 V17.0 Optimized Swarm Node on port {port} | Server: {SERVER_ID}")
     print(f"🔐 Admin password: {ADMIN_PASSWORD}")
+    print(f"🏥 Health check: /health")
     app.run(host='0.0.0.0', port=port, threaded=True)
