@@ -1,8 +1,9 @@
-import os, json, time, subprocess, requests, threading, re, urllib.parse, hashlib, traceback, fcntl, sys, uuid, socket
+import os, json, time, subprocess, requests, threading, re, urllib.parse, hashlib, traceback, fcntl, sys, uuid, socket, random
 import asyncio, aiohttp
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from functools import wraps
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 import psycopg2
 from psycopg2 import pool
 
@@ -29,7 +30,19 @@ NEON_DB_URL = os.environ.get('NEON_DB_URL', "postgresql://neondb_owner:npg_Rh0xI
 SUPABASE_URL = os.environ.get('SUPABASE_URL', "https://cnkbewgpguyojiebztbs.supabase.co/rest/v1/reels")
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY', "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNua2Jld2dwZ3V5b2ppZWJ6dGJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyODU0NzUsImV4cCI6MjA4OTg2MTQ3NX0.ldS5knPaT1imexuRH9jSlTDB1mRSpoozFXlmhbDw2fU")
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
-FFMPEG_PATH = os.environ.get('FFMPEG_PATH', 'ffmpeg')
+FFMPEG_PATH = os.environ.get('FFMPEG_PATH', 'ffmpeg')  # kept only for thumbnail generation (optional)
+
+# ---------------------------
+#  TELEGRAM CONFIGURATION (from environment variables)
+# ---------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID', '-1003810911847')  # e.g., '@my_channel' or '-1001234567890'
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
+
+if TELEGRAM_ENABLED:
+    print("🤖 Telegram integration ENABLED")
+else:
+    print("⚠️ Telegram integration DISABLED (missing BOT_TOKEN or CHANNEL_ID)")
 
 # ---------------------------
 #  DIRECTORIES
@@ -44,7 +57,7 @@ for d in [VIDEO_DIR, PREVIEW_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
 # ---------------------------
-#  FFMPEG CHECK
+#  FFMPEG CHECK (only for optional preview)
 # ---------------------------
 def check_ffmpeg():
     try:
@@ -52,27 +65,40 @@ def check_ffmpeg():
         return True
     except: return False
 FFMPEG_AVAILABLE = check_ffmpeg()
+if not FFMPEG_AVAILABLE:
+    print("⚠️ FFmpeg not found – preview generation will be skipped (video uploads unaffected)")
 
 # ---------------------------
-#  CROSS‑PROCESS STATE (file‑based)
+#  CROSS‑PROCESS STATE (file‑based with fallback for missing fcntl)
 # ---------------------------
 def read_state():
     try:
         with open(STATE_FILE, 'r') as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH)
+            except OSError:
+                pass
             data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
+            try:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            except OSError:
+                pass
             return data
-    except:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {"logs": [], "scraper": "Idle", "reposter": "Idle", "queue_size": 0, "cleaner_running": False, "fast_mode": False, "current_operation": None}
 def write_state(data):
     with open(STATE_FILE, 'w') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except OSError:
+            pass
         json.dump(data, f, indent=2)
-        fcntl.flock(f, fcntl.LOCK_UN)
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except OSError:
+            pass
 def emit_log(msg, category="SYS", color="#10b981", is_error=False):
     t = ist_time_str()
-    # Print full message to console (no truncation)
     print(f"[{t}] [{category}] {msg}")
     if is_error:
         print(traceback.format_exc())
@@ -179,18 +205,19 @@ def init_neon_db():
 init_neon_db()
 
 # ---------------------------
-#  SETTINGS MANAGER
+#  SETTINGS MANAGER (UPDATED for lakshminighty account)
 # ---------------------------
 DEFAULT_SETTINGS = {
-    "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y",
-    "my_user": "telugustuffs",
+    "my_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6Imxha3NobWluaWdodHkiLCJpYXQiOjE3NzU3MzYxMjksImV4cCI6MTc3ODMyODEyOX0.qpJh3OKE_VO4Z9mfKf2YzIxQxWO70C4nVbkodcEiT1k",
+    "my_user": "lakshminighty",
     "main_domain": "love.viraly.wtf",
     "upload_domain": "loveupload.viraly.wtf",
     "blacklist": "promo, link in bio, part 2, pt 2, subscribe",
     "del_payload": "U2FsdGVkX1+0BWWOC9q0iGdVxXxQPvzazMUrmc4pvXw=",
-    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775372645$o5$g1$t1775372777$j59$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlbHVndXN0dWZmcyIsImlhdCI6MTc3NTMyMDc3OSwiZXhwIjoxNzc3OTEyNzc5fQ.48_8h8tDpZapGhFzMFgb9-DJSa9UZyArE2gvyJbk-1Y; oldUserId=U2FsdGVkX18zmdA%2Bj20qXbN7HwHHjkbBEzE5nIJVaWE%3D; anonUserId=U2FsdGVkX1%2B0BWWOC9q0iGdVxXxQPvzazMUrmc4pvXw%3D; allow18=%7B%22allow18%22%3Atrue%7D"
+    "full_cookie": "_ga=GA1.1.176737717.1775237049; _ga_CHGRECY8GV=GS2.1.s1775735803$o24$g1$t1775736129$j36$l0$h0; accessToken=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6Imxha3NobWluaWdodHkiLCJpYXQiOjE3NzU3MzYxMjksImV4cCI6MTc3ODMyODEyOX0.qpJh3OKE_VO4Z9mfKf2YzIxQxWO70C4nVbkodcEiT1k; oldUserId=U2FsdGVkX1%2BsdPE%2FDNWxpuV0gBVTDe9PfWlFUX8ZRPU%3D; anonUserId=U2FsdGVkX1%2FnvOcMUzeh%2FpSgfeJbNl2V%2FusEq7rPhyg%3D; allow18=%7B%22allow18%22%3Atrue%7D; dom3ic8zudi28v8lr6fgphwffqoz0j6c=4b6b5902-876f-4341-915e-ec228ea20e0c%3A3%3A1"
 }
-if not os.path.exists(SETTINGS_FILE): json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
+if not os.path.exists(SETTINGS_FILE):
+    json.dump(DEFAULT_SETTINGS, open(SETTINGS_FILE, 'w'), indent=4)
 def get_settings(): return json.load(open(SETTINGS_FILE))
 def get_headers():
     conf = get_settings()
@@ -248,7 +275,6 @@ def add_to_neon_queue(video_id, size_limit, source_type, source_value, fast=Fals
         return_db_connection(conn)
 
 def get_next_job():
-    """Fetch next job: fast mode first, then normal, using SKIP LOCKED."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -344,6 +370,47 @@ def filter_existing_ids(vid_list):
         return_db_connection(conn)
 
 # ---------------------------
+#  TELEGRAM SENDER (with retry & rate limit)
+# ---------------------------
+def send_video_to_telegram(video_path, caption, max_retries=3):
+    """Send video file to Telegram channel. Returns True on success."""
+    if not TELEGRAM_ENABLED:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+    # Telegram limit: video file ≤ 50 MB
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if file_size_mb > 50:
+        emit_log(f"📤 Telegram skip: video too large ({file_size_mb:.1f}MB > 50MB)", "TELEGRAM", "#f59e0b")
+        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(video_path, 'rb') as f:
+                files = {'video': f}
+                data = {
+                    'chat_id': TELEGRAM_CHANNEL_ID,
+                    'caption': caption[:1024],  # Telegram caption limit
+                    'supports_streaming': True
+                }
+                resp = requests.post(url, data=data, files=files, timeout=60)
+            if resp.status_code == 200:
+                emit_log(f"📤 Telegram sent successfully", "TELEGRAM", "#10b981")
+                return True
+            elif resp.status_code == 429:
+                wait = 2 ** attempt + random.uniform(0, 2)
+                emit_log(f"⚠️ Telegram rate limit, retry {attempt}/{max_retries} after {wait:.1f}s", "TELEGRAM", "#f59e0b")
+                time.sleep(wait)
+                continue
+            else:
+                emit_log(f"⚠️ Telegram error {resp.status_code}: {resp.text[:100]}", "TELEGRAM", "#ef4444", True)
+                return False
+        except Exception as e:
+            emit_log(f"⚠️ Telegram exception: {e}, retry {attempt}/{max_retries}", "TELEGRAM", "#ef4444", True)
+            time.sleep(2 ** attempt)
+            continue
+    emit_log(f"❌ Telegram failed after {max_retries} retries", "TELEGRAM", "#ef4444", True)
+    return False
+
+# ---------------------------
 #  PERSISTENT ASYNC LOOP
 # ---------------------------
 async_loop = None
@@ -361,13 +428,35 @@ async_thread = threading.Thread(target=start_async_loop, daemon=True)
 async_thread.start()
 time.sleep(0.1)
 
-async def async_scrape_ids(mode, query):
+# ---------------------------
+#  FAST SCRAPER (single-line console update)
+# ---------------------------
+def progress_print(page, new, total, empty=0, finished=False, error=None):
+    """Print progress on the same line using carriage return."""
+    if error:
+        msg = f"⚠️ Page {page}: error - {error}"
+    elif finished:
+        msg = f"✅ Scraping finished after {page+1} pages. Total IDs: {total}      "
+    else:
+        if new > 0:
+            msg = f"📄 Page {page}: +{new:4} IDs | Total: {total:6} | Empty streak: {empty}/10"
+        else:
+            msg = f"📄 Page {page}: no new IDs  | Total: {total:6} | Empty streak: {empty}/10"
+    sys.stdout.write(f"\r{msg}")
+    sys.stdout.flush()
+    if finished or error:
+        print()  # newline after final message
+
+async def async_scrape_ids(mode, query, progress_callback=None):
+    """Scrape all pages until 10 consecutive empty pages (no artificial delay)."""
     conf = get_settings()
     s_headers = get_headers()
     all_vids = set()
-    page, empty_count = 0, 0
+    page = 0
+    empty_count = 0
+    max_empty = 10
     async with aiohttp.ClientSession() as session:
-        while empty_count < 3 and page < 50:
+        while True:
             try:
                 if mode == "username":
                     url = f"https://{conf['main_domain']}/profile/{query}/videos/latest"
@@ -378,13 +467,42 @@ async def async_scrape_ids(mode, query):
                     async with session.get(url, headers=s_headers, timeout=10) as r:
                         text = await r.text()
                 vids = re.findall(r'"videoId":"([^"]+)"', text)
-                if not vids: empty_count += 1
-                else: empty_count = 0; all_vids.update(vids)
+                if not vids:
+                    empty_count += 1
+                    if progress_callback:
+                        await progress_callback(page, 0, len(all_vids), empty=empty_count)
+                    if empty_count >= max_empty:
+                        if progress_callback:
+                            await progress_callback(page, 0, len(all_vids), empty=empty_count, finished=True)
+                        break
+                else:
+                    empty_count = 0
+                    new_count = len([v for v in vids if v not in all_vids])
+                    all_vids.update(vids)
+                    if progress_callback:
+                        await progress_callback(page, new_count, len(all_vids))
                 page += 1
             except Exception as e:
-                emit_log(f"Scrape error: {e}", "SCRAPE", "#ef4444", True)
+                if progress_callback:
+                    await progress_callback(page, 0, len(all_vids), error=str(e))
                 break
     return list(all_vids)
+
+def scrape_ids_sync(mode, query, report_func=None):
+    """Synchronous wrapper for async scraper with progress reporting."""
+    async def _scrape():
+        if report_func:
+            async def progress(p, new_cnt, total, empty=0, finished=False, error=None):
+                if error:
+                    report_func(p, 0, total, empty=empty, error=error)
+                elif finished:
+                    report_func(p, 0, total, empty=empty, finished=True)
+                else:
+                    report_func(p, new_cnt, total, empty=empty)
+            return await async_scrape_ids(mode, query, progress)
+        else:
+            return await async_scrape_ids(mode, query)
+    return run_coroutine(_scrape())
 
 def extract_video_id_from_input(input_str):
     input_str = input_str.strip()
@@ -414,7 +532,46 @@ def run_exclusive(func):
     return wrapper
 
 # ---------------------------
-#  WORKER ENGINE (runs continuously, no lock)
+#  UPLOAD WITH RETRY LOGIC (website, raw video)
+# ---------------------------
+def upload_with_retry(file_path, data, headers, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(file_path, 'rb') as f:
+                up = requests.post(
+                    f"https://{data['upload_domain']}/upload",
+                    files={'files': (os.path.basename(file_path), f, 'video/mp4')},
+                    data={"tag": data['category_tag'], "title": data['title'], "description": data['desc'],
+                          "country": "IN", "username": data['username'], "start": "0", "end": "0"},
+                    headers=headers,
+                    timeout=60
+                )
+            if up.status_code == 200:
+                return up
+            elif up.status_code == 429:
+                wait = 2 ** attempt + random.uniform(0, 2)
+                emit_log(f"⚠️ Rate limited (429), retry {attempt}/{max_retries} after {wait:.1f}s", "REPOST", "#f59e0b")
+                time.sleep(wait)
+                continue
+            elif up.status_code >= 500:
+                wait = 2 ** attempt + random.uniform(0, 2)
+                emit_log(f"⚠️ Server error {up.status_code}, retry {attempt}/{max_retries} after {wait:.1f}s", "REPOST", "#f59e0b")
+                time.sleep(wait)
+                continue
+            else:
+                return up
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            emit_log(f"⚠️ Network error: {e}, retry {attempt}/{max_retries}", "REPOST", "#f59e0b")
+            time.sleep(2 ** attempt)
+            continue
+        except Exception as e:
+            emit_log(f"⚠️ Upload exception: {e}", "REPOST", "#ef4444", True)
+            return None
+    emit_log(f"❌ Upload failed after {max_retries} retries", "REPOST", "#ef4444", True)
+    return None
+
+# ---------------------------
+#  WORKER ENGINE (no watermark, sends to Telegram after website upload)
 # ---------------------------
 def reposter_worker():
     emit_log(f"👷 Worker online (Server: {SERVER_ID})", "WORKER", "#f59e0b")
@@ -428,19 +585,22 @@ def reposter_worker():
                 continue
             update_status(reposter=f"Processing: {job['video_id'][:8]}")
             process_video_job(job)
+            time.sleep(random.uniform(2, 5))
         except Exception as e:
             emit_log(f"Worker loop error: {e}", "WORKER", "#ef4444", True)
-            time.sleep(5)
+            time.sleep(10)
 
 def process_video_job(job):
     video_id, size_limit = job["video_id"], job["size_limit"]
-    raw_file = watermarked_file = preview_file = None
+    raw_file = preview_file = None   # no watermarked file
     conf = get_settings()
     h_media = get_headers()
     try:
         domain = conf['main_domain']
+        encoded_id = quote(video_id, safe='')
+        # Thumbnail check (for duplicate detection)
+        thumb_url = f"https://{domain}/media/images/{encoded_id}.jpg"
         emit_log(f"🔍 Checking thumbnail for {video_id[:8]}...", "REPOST", "#0ea5e9")
-        thumb_url = f"https://{domain}/media/images/{video_id}.jpg"
         thumb_resp = requests.get(thumb_url, headers=h_media, timeout=8)
         thumb_hash = None
         if thumb_resp.status_code == 200:
@@ -459,7 +619,7 @@ def process_video_job(job):
         category_tag = "18+"
         original_username = ""
         try:
-            r_api = requests.get(f"https://{domain}/video/{urllib.parse.quote(video_id, safe='')}", headers=h_media, timeout=10).json()
+            r_api = requests.get(f"https://{domain}/video/{encoded_id}", headers=h_media, timeout=10).json()
             vid_data = r_api[0] if isinstance(r_api, list) and len(r_api) > 0 else (r_api if isinstance(r_api, dict) else {})
             if vid_data.get("title"): title = vid_data["title"]
             if vid_data.get("description"): desc = vid_data["description"]
@@ -479,7 +639,7 @@ def process_video_job(job):
             update_job_status(job["id"], 'failed', "Blacklisted")
             return
         # Size check
-        d_url = f"https://{domain}/media/videos/{video_id}.mp4"
+        d_url = f"https://{domain}/media/videos/{encoded_id}.mp4"
         size_mb = 0
         with requests.get(d_url, headers=h_media, stream=True, timeout=10) as r_size:
             if r_size.status_code == 200 and 'content-length' in r_size.headers:
@@ -489,56 +649,75 @@ def process_video_job(job):
             emit_log(f"⏭️ Too large: {size_mb}MB > {size_limit}MB", "REPOST", "#f43f5e")
             update_job_status(job["id"], 'failed', f"Size {size_mb}MB > {size_limit}MB")
             return
-        # Download
+        # Download raw video (with retry)
         emit_log(f"📥 Downloading {video_id[:8]}...", "REPOST", "#0ea5e9")
         safe_label = re.sub(r'[^a-zA-Z0-9]', '_', video_id)[-12:]
         raw_file = os.path.join(VIDEO_DIR, f"raw_{safe_label}.mp4")
-        watermarked_file = os.path.join(VIDEO_DIR, f"video_{safe_label}.mp4")
         preview_file = os.path.join(PREVIEW_DIR, f"{safe_label}.jpg")
-        with requests.get(d_url, headers=h_media, stream=True) as s_res:
-            if s_res.status_code != 200: raise Exception("404 Not Found")
-            with open(raw_file, 'wb') as f:
-                for chunk in s_res.iter_content(8192): f.write(chunk)
+        download_success = False
+        for attempt in range(1, 4):
+            try:
+                with requests.get(d_url, headers=h_media, stream=True, timeout=30) as s_res:
+                    if s_res.status_code != 200:
+                        raise Exception(f"HTTP {s_res.status_code}")
+                    with open(raw_file, 'wb') as f:
+                        for chunk in s_res.iter_content(8192):
+                            f.write(chunk)
+                download_success = True
+                break
+            except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as e:
+                emit_log(f"⚠️ Download error (attempt {attempt}/3): {e}", "REPOST", "#f59e0b")
+                time.sleep(2 ** attempt)
+                continue
+        if not download_success:
+            raise Exception("Download failed after retries")
         emit_log(f"✅ Downloaded {raw_file}", "REPOST", "#10b981")
-        file_to_upload = raw_file
-        # Watermark decision
-        if size_limit == 9999 and size_mb > 40:
-            emit_log(f"⚡ No watermark (size >40MB & no limit)", "REPOST", "#d946ef")
+        # Generate preview thumbnail (optional, only if ffmpeg available)
+        if FFMPEG_AVAILABLE:
             subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
             emit_log(f"📸 Preview generated", "REPOST", "#0ea5e9")
-        elif not FFMPEG_AVAILABLE:
-            emit_log(f"⚠️ FFmpeg missing → uploading raw video", "REPOST", "#f59e0b")
-        else:
-            emit_log(f"👻 Applying ghost watermark...", "REPOST", "#d946ef")
-            vf = "hflip,eq=brightness=0.02:saturation=1.05,scale='min(720,iw)':-2,drawtext=text='telugu stuffs':fontcolor=yellow@0.6:fontsize=24:x=(w-text_w)/2:y=h-th-14"
-            subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-ss', '1', '-vframes', '1', preview_file], capture_output=True)
-            subprocess.run([FFMPEG_PATH, '-y', '-i', raw_file, '-vf', vf, '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-c:a', 'copy', watermarked_file], capture_output=True)
-            file_to_upload = watermarked_file
-            emit_log(f"✅ Watermark applied", "REPOST", "#10b981")
-        # Upload
-        emit_log(f"📤 Uploading to {conf['upload_domain']}...", "REPOST", "#0ea5e9")
+        # Upload raw video to website (no watermark)
+        emit_log(f"📤 Uploading raw video to website {conf['upload_domain']}...", "REPOST", "#0ea5e9")
         base = ".".join(conf['main_domain'].split('.')[-2:])
-        with open(file_to_upload, 'rb') as f:
-            up = requests.post(
-                f"https://{conf['upload_domain']}/upload",
-                files={'files': (f"video_{safe_label}.mp4", f, 'video/mp4')},
-                data={"tag": category_tag, "title": title, "description": desc, "country": "IN", "username": conf['my_user'], "start": "0", "end": "0"},
-                headers={"Cookie": h_media["Cookie"], "Origin": f"https://{base}"}
-            )
+        upload_headers = {"Cookie": h_media["Cookie"], "Origin": f"https://{base}"}
+        upload_data = {
+            'upload_domain': conf['upload_domain'],
+            'category_tag': category_tag,
+            'title': title,
+            'desc': desc,
+            'username': conf['my_user']
+        }
+        up = upload_with_retry(raw_file, upload_data, upload_headers)
+        if up is None:
+            raise Exception("Upload to website failed after retries")
         if up.status_code == 200 or (up.status_code == 400 and "allowedMimeTypes is not defined" in up.text):
             uploaded_id = re.search(r'"videoId":"([^"]+)"', up.text)
             uploaded_id = uploaded_id.group(1) if uploaded_id else video_id
             if thumb_hash:
                 mark_video_uploaded(thumb_hash, uploaded_id, video_id)
-            emit_log(f"✅ Success: {video_id[:8]} → {uploaded_id}", "REPOST", "#10b981")
+            emit_log(f"✅ Website upload success: {video_id[:8]} → {uploaded_id}", "REPOST", "#10b981")
             update_job_status(job["id"], 'completed')
+        elif up.status_code == 400 and '"error":"No captcha token provided"' in up.text:
+            emit_log(f"❌ Captcha token missing! Please refresh your cookie in Settings.", "REPOST", "#ef4444", True)
+            update_job_status(job["id"], 'failed', "Captcha token required")
+            return
         else:
-            raise Exception(f"Upload failed: {up.status_code} | {up.text[:200]}")
+            raise Exception(f"Website upload failed: {up.status_code} | {up.text[:200]}")
+        # ---------------------------
+        #  SEND TO TELEGRAM (if enabled)
+        # ---------------------------
+        if TELEGRAM_ENABLED:
+            caption = f"{title}\n\n{desc}\n\n#viral #reels"
+            emit_log(f"📤 Sending raw video to Telegram channel...", "TELEGRAM", "#0ea5e9")
+            if send_video_to_telegram(raw_file, caption):
+                emit_log(f"✅ Telegram sent successfully", "TELEGRAM", "#10b981")
+            else:
+                emit_log(f"⚠️ Telegram send failed (check token/channel)", "TELEGRAM", "#f59e0b")
     except Exception as e:
         emit_log(f"🔥 Error processing {video_id}: {e}", "REPOST", "#ef4444", True)
         update_job_status(job["id"], 'failed', str(e))
     finally:
-        for f in [raw_file, watermarked_file, preview_file]:
+        for f in [raw_file, preview_file]:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
@@ -585,13 +764,16 @@ def native_cleaner_task():
     headers = get_headers()
     session = requests.Session()
     emit_log("📄 Fetching profile videos...", "CLEANER", "#06b6d4")
-    while empty_pages < 2 and page < 80:
+    while empty_pages < 2 and page < 200:
         try:
             res = session.post(f"https://{domain}/profile/{username}/videos/latest", headers=headers, json={"page": page}, timeout=15)
             vids = re.findall(r'"videoId":"([^"]+)"', res.text)
-            if not vids: empty_pages += 1
-            else: empty_pages = 0; all_videos.extend(vids)
-            emit_log(f"   Page {page}: found {len(vids)} videos (total {len(all_videos)})", "CLEANER", "#64748b")
+            if not vids:
+                empty_pages += 1
+            else:
+                empty_pages = 0
+                all_videos.extend(vids)
+                emit_log(f"   Page {page}: +{len(vids)} (Total: {len(all_videos)})", "CLEANER", "#64748b")
             page += 1
             time.sleep(0.5)
         except Exception as e:
@@ -599,7 +781,7 @@ def native_cleaner_task():
             break
     all_videos = list(dict.fromkeys(all_videos))
     all_videos.reverse()
-    emit_log(f"📊 Total unique videos in profile: {len(all_videos)}", "CLEANER", "#06b6d4")
+    emit_log(f"📊 Total unique videos: {len(all_videos)}", "CLEANER", "#06b6d4")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -619,12 +801,12 @@ def native_cleaner_task():
                         cur.execute("INSERT INTO image_hashes (vid, hash) VALUES (%s, %s) ON CONFLICT DO NOTHING", (vid, h))
                         conn.commit()
                         known_hashes[vid] = h
-                        emit_log(f"   Hash generated: {h[:8]}", "CLEANER", "#64748b")
+                        emit_log(f"   Hash: {h[:8]}", "CLEANER", "#64748b")
                     else:
-                        emit_log(f"   ⚠️ No thumbnail, skipping", "CLEANER", "#f59e0b")
+                        emit_log(f"   ⚠️ No thumbnail", "CLEANER", "#f59e0b")
                         continue
                 except Exception as e:
-                    emit_log(f"   ⚠️ Hash error: {e}", "CLEANER", "#f59e0b")
+                    emit_log(f"   ⚠️ Hash error", "CLEANER", "#f59e0b")
                     continue
             if h in seen_hashes:
                 emit_log(f"🚨 DUPLICATE: {vid[:8]} matches {seen_hashes[h][:8]} → deleting", "CLEANER", "#f43f5e")
@@ -632,16 +814,16 @@ def native_cleaner_task():
                     del_res = session.post(f"https://{domain}/uservideo/delete/{vid}", json={"username": payload}, headers=headers, timeout=10)
                     if del_res.status_code == 200:
                         deleted += 1
-                        emit_log(f"   ✅ Deleted {vid[:8]}", "CLEANER", "#10b981")
+                        emit_log(f"   ✅ Deleted", "CLEANER", "#10b981")
                     else:
                         emit_log(f"   ❌ Delete failed: {del_res.status_code}", "CLEANER", "#ef4444")
                 except Exception as e:
-                    emit_log(f"   ❌ Delete error: {e}", "CLEANER", "#ef4444", True)
+                    emit_log(f"   ❌ Delete error", "CLEANER", "#ef4444", True)
                 time.sleep(1.2)
             else:
                 seen_hashes[h] = vid
-                emit_log(f"   ✅ New hash recorded", "CLEANER", "#10b981")
-        emit_log(f"✨ CLEANER FINISHED: Deleted {deleted} duplicate videos.", "CLEANER", "#10b981")
+                emit_log(f"   ✅ New hash", "CLEANER", "#10b981")
+        emit_log(f"✨ CLEANER FINISHED: Deleted {deleted} duplicates.", "CLEANER", "#10b981")
     except Exception as e:
         emit_log(f"Cleaner DB error: {e}", "CLEANER", "#ef4444", True)
     finally:
@@ -658,13 +840,13 @@ def sync_uploaded_videos_from_profile():
     all_videos = []
     page, empty = 0, 0
     session = requests.Session()
-    while empty < 2 and page < 80:
+    while empty < 2 and page < 200:
         try:
             res = session.post(f"https://{domain}/profile/{username}/videos/latest", headers=headers, json={"page": page}, timeout=15)
             vids = re.findall(r'"videoId":"([^"]+)"', res.text)
             if not vids: empty += 1
             else: empty = 0; all_videos.extend(vids)
-            emit_log(f"   Page {page}: {len(vids)} videos (total {len(all_videos)})", "CLEANER", "#64748b")
+            emit_log(f"   Page {page}: +{len(vids)} (Total: {len(all_videos)})", "CLEANER", "#64748b")
             page += 1
             time.sleep(0.5)
         except: break
@@ -681,7 +863,7 @@ def sync_uploaded_videos_from_profile():
                     h = hashlib.md5(img.content).hexdigest()
                     cur.execute("INSERT INTO uploaded_videos (hash, video_id, original_source_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                                 (h, vid, vid))
-                    emit_log(f"   ✅ Recorded hash {h[:8]}", "CLEANER", "#10b981")
+                    emit_log(f"   ✅ Recorded", "CLEANER", "#10b981")
                 else:
                     emit_log(f"   ⚠️ No thumbnail", "CLEANER", "#f59e0b")
             except Exception as e:
@@ -694,7 +876,7 @@ def sync_uploaded_videos_from_profile():
     emit_log(f"✅ SYNC COMPLETE: {len(all_videos)} videos recorded.", "CLEANER", "#10b981")
 
 # ---------------------------
-#  SUPABASE HELPERS
+#  SUPABASE HELPERS (fixed column)
 # ---------------------------
 def insert_into_supabase(video_ids):
     if not video_ids: return
@@ -704,7 +886,7 @@ def insert_into_supabase(video_ids):
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates"
     }
-    records = [{"id": vid, "scraped_at": ist_now().strftime("%Y-%m-%d %H:%M:%S")} for vid in video_ids]
+    records = [{"id": vid} for vid in video_ids]
     try:
         r = requests.post(SUPABASE_URL, headers=headers, json=records, timeout=10)
         if r.status_code >= 400:
@@ -761,15 +943,22 @@ def api_supabase_archive():
     def task():
         if mode == 'single':
             vid = extract_video_id_from_input(target)
-            if vid: insert_into_supabase([vid])
-            else: emit_log(f"Invalid ID: {target}", "ARCHIVE", "#ef4444", True)
+            if vid:
+                insert_into_supabase([vid])
+                emit_log(f"Archived single ID: {vid}", "ARCHIVE", "#8b5cf6")
+            else:
+                emit_log(f"Invalid ID: {target}", "ARCHIVE", "#ef4444", True)
         else:
             emit_log(f"Scraping {mode} '{target}' for Supabase archive...", "ARCHIVE", "#8b5cf6")
-            vids = run_coroutine(async_scrape_ids(mode, target))
+            def progress(page, new_cnt, total, empty=0, finished=False, error=None):
+                progress_print(page, new_cnt, total, empty, finished, error)
+            vids = scrape_ids_sync(mode, target, progress)
             if vids:
+                print()
                 emit_log(f"Found {len(vids)} IDs, archiving...", "ARCHIVE", "#8b5cf6")
                 insert_into_supabase(vids)
             else:
+                print()
                 emit_log(f"No IDs found for {mode} '{target}'", "ARCHIVE", "#ef4444", True)
     threading.Thread(target=task, daemon=True).start()
     return jsonify({"message": "Archive started"})
@@ -807,10 +996,14 @@ def api_repost():
                 emit_log(f"Manual: added {added} jobs", "QUEUE", "#f59e0b")
             else:
                 emit_log(f"Scraping {mode} '{target}' for queue (fast={fast})...", "SCRAPE", "#3b82f6")
-                scraped_ids = run_coroutine(async_scrape_ids(mode, target))
+                def progress(page, new_cnt, total, empty=0, finished=False, error=None):
+                    progress_print(page, new_cnt, total, empty, finished, error)
+                scraped_ids = scrape_ids_sync(mode, target, progress)
                 if not scraped_ids:
+                    print()
                     emit_log(f"No IDs found", "SCRAPE", "#ef4444", True)
                     return
+                print()
                 emit_log(f"Found {len(scraped_ids)} IDs, filtering existing...", "SCRAPE", "#3b82f6")
                 new_ids = filter_existing_ids(scraped_ids)
                 emit_log(f"{len(new_ids)} new IDs to add", "SCRAPE", "#3b82f6")
@@ -851,7 +1044,7 @@ def force_process():
     return jsonify({"status": "forced"})
 
 # ---------------------------
-#  UI TEMPLATES (Mobile Responsive with styled inputs)
+#  UI TEMPLATES (Mobile Responsive)
 # ---------------------------
 LOGIN_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes"><title>Swarm Login</title><style>
@@ -865,7 +1058,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes, viewport-fit=cover">
-    <title>V17.0 Swarm Node | Optimized</title>
+    <title>V24.0 Swarm Node | Telegram Forward</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1120; color: #f1f5f9; padding: 16px; }
@@ -947,7 +1140,7 @@ HTML_TEMPLATE = """
 <body>
 <div class="container">
     <div class="header">
-        <div class="top-bar"><h1>🐝 V17.0 OPTIMIZED SWARM</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
+        <div class="top-bar"><h1>🐝 V24.0 TELEGRAM SWARM</h1><a href="/logout" class="logout-btn">🚪 Logout</a></div>
         <div class="badge">🖥️ {{ server_id }}</div>
     </div>
     <div class="status-bar">
@@ -966,7 +1159,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
     <div class="card" style="border-top-color:#f59e0b;">
-        <h2>🎬 Reposter</h2>
+        <h2>🎬 Reposter + Telegram</h2>
         <div class="input-group">
             <div class="input-row"><select id="rep_mode"><option value="keyword">Keyword</option><option value="username">Username</option><option value="manual">Manual IDs</option></select></div>
             <input id="rep_input" placeholder="Keyword, username, or IDs...">
@@ -1021,7 +1214,7 @@ threading.Thread(target=reposter_worker, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
-    print(f"🚀 V17.0 Optimized Swarm Node on port {port} | Server: {SERVER_ID}")
+    print(f"🚀 V24.0 Swarm Node (Telegram enabled: {TELEGRAM_ENABLED}) on port {port} | Server: {SERVER_ID}")
     print(f"🔐 Admin password: {ADMIN_PASSWORD}")
     print(f"🏥 Health check: /health")
     app.run(host='0.0.0.0', port=port, threaded=True)
