@@ -46,7 +46,6 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 # ---------------------------
 try:
     redis_client = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-    # Ping to check connection
     redis_client.ping()
     print("✅ Connected to Central Redis Queue (Upstash REST)")
 except Exception as e:
@@ -198,7 +197,7 @@ def run_coroutine(coro):
 threading.Thread(target=start_async_loop, daemon=True).start()
 time.sleep(0.1)
 
-async def async_scrape_ids(mode, query, progress_callback=None):
+async def async_scrape_ids(mode, query):
     conf = {"main_domain": "love.viraly.wtf"}
     s_headers = {"User-Agent": "Mozilla/5.0"}
     all_vids = set()
@@ -345,6 +344,7 @@ def api_repost():
             added = sum(1 for vid in ids if add_to_queue(vid, "manual", "user_input"))
             emit_log(f"Manual: queued {added} new videos to Redis", "QUEUE", "#f59e0b")
         else:
+            update_status(scraper=f"Scraping {mode} '{target}'...")
             emit_log(f"Scraping {mode} '{target}'...", "SCRAPE", "#3b82f6")
             scraped_ids = run_coroutine(async_scrape_ids(mode, target))
             if scraped_ids:
@@ -352,6 +352,7 @@ def api_repost():
                 emit_log(f"Queued {added} new videos to Redis", "SCRAPE", "#3b82f6")
             else:
                 emit_log(f"No IDs found", "SCRAPE", "#ef4444")
+            update_status(scraper="Idle")
     
     threading.Thread(target=task, daemon=True).start()
     return jsonify({"status": "queued"})
@@ -366,9 +367,9 @@ def force_process():
 #  UI TEMPLATES
 # ---------------------------
 LOGIN_TEMPLATE = """
-<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Login</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#0f172a;height:100vh;display:flex;align-items:center;justify-content:center}.login-card{background:#1e293b;padding:32px;border-radius:28px;text-align:center;width:300px}h2,input,button{margin-bottom:16px;width:100%}input,button{padding:12px;border-radius:12px;border:none}button{background:#3b82f6;color:white;cursor:pointer;font-weight:bold}
-</style></head><body><div class="login-card"><h2 style="color:white">Login</h2><form method="POST"><input type="password" name="password" autofocus><button type="submit">Enter</button></form></div></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Telegram Swarm Login</title><style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}.login-card{background:rgba(30,41,59,0.9);backdrop-filter:blur(12px);padding:32px 24px;border-radius:28px;width:100%;max-width:380px;text-align:center;border:1px solid rgba(255,255,255,0.1)}h2{color:#f8fafc;margin-bottom:24px}input{width:100%;padding:14px;margin:12px 0;border-radius:16px;border:none;background:#0f172a;color:white;border:1px solid #334155}input:focus{outline:none;border-color:#3b82f6}button{width:100%;padding:14px;background:#3b82f6;border:none;border-radius:40px;color:white;font-weight:600;cursor:pointer}.error{color:#ef4444;margin-top:12px}
+</style></head><body><div class="login-card"><h2>🤖 Telegram Swarm</h2><form method="POST"><input type="password" name="password" placeholder="Enter password" autofocus><button type="submit">Authenticate</button>{% if error %}<div class="error">{{ error }}</div>{% endif %}</form></div></body></html>
 """
 
 HTML_TEMPLATE = """
@@ -376,56 +377,76 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Swarm Node</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Telegram Swarm Node</title>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:16px}
+        body{font-family:'Inter',sans-serif;background:#0b1120;color:#f1f5f9;padding:16px}
         .container{max-width:600px;margin:0 auto}
-        .status-bar{background:#1e293b;border-radius:16px;padding:12px;margin-bottom:20px;display:flex;gap:12px;flex-wrap:wrap}
-        .status-item{background:#0f172a;padding:5px 12px;border-radius:20px;font-size:12px}
-        .card{background:#1e293b;border-radius:16px;padding:20px;margin-bottom:20px}
-        textarea,select,button{width:100%;padding:12px;margin-bottom:12px;border-radius:8px;border:none;background:#0f172a;color:white}
-        button{background:#3b82f6;cursor:pointer;font-weight:bold}
-        #logs{height:300px;overflow-y:auto;font-family:monospace;font-size:12px;background:#020617;padding:12px;border-radius:8px}
+        .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+        h1{font-size:1.6rem;background:linear-gradient(135deg,#60a5fa,#c084fc);-webkit-background-clip:text;background-clip:text;color:transparent}
+        .badge{background:#1e293b;padding:5px 12px;border-radius:40px;font-size:0.7rem}
+        .logout-btn{background:#ef4444;padding:6px 16px;border-radius:40px;text-decoration:none;color:white;font-size:0.8rem}
+        .status-bar{background:#1e293b;border-radius:20px;padding:12px 16px;margin-bottom:20px;display:flex;gap:12px;flex-wrap:wrap}
+        .status-item{background:#0f172a;padding:5px 12px;border-radius:40px;font-size:0.75rem}
+        .card{background:#1e293b;border-radius:24px;padding:20px;margin-bottom:20px;border-top:3px solid #3b82f6}
+        .card h2{font-size:1.3rem;margin-bottom:16px}
+        .input-group{display:flex;flex-direction:column;gap:12px;margin:16px 0}
+        .input-row{display:flex;gap:10px;flex-wrap:wrap}
+        select,input,textarea{flex:1;padding:12px;border-radius:16px;border:1px solid #334155;background:#0f172a;color:white}
+        button{background:#3b82f6;padding:12px 20px;border:none;border-radius:40px;color:white;font-weight:600;cursor:pointer}
+        .btn-orange{background:#f59e0b}
+        .btn-red{background:#ef4444}
+        hr{margin:16px 0;border-color:#334155}
+        .logs-panel{background:#0f172a;border-radius:20px;padding:16px}
+        .logs-header{display:flex;justify-content:space-between;margin-bottom:12px}
+        #logs{height:320px;overflow-y:auto;font-family:monospace;font-size:11px;background:#020617;padding:12px;border-radius:16px}
+        .toast{position:fixed;bottom:20px;right:20px;background:#1e293b;border-left:4px solid #10b981;padding:12px 20px;border-radius:40px;z-index:1000}
+        @media (max-width:600px){.input-row{flex-direction:column}}
     </style>
 </head>
 <body>
 <div class="container">
-    <h2>🤖 Swarm Node: {{ server_id }}</h2><br>
+    <div class="header">
+        <h1>🤖 TELEGRAM SWARM</h1>
+        <div><span class="badge">🖥️ {{ server_id }}</span><a href="/logout" class="logout-btn" style="margin-left:10px">Logout</a></div>
+    </div>
     <div class="status-bar">
-        <div class="status-item">📡 Scraping: <span id="s-scrape">Idle</span></div>
-        <div class="status-item">⚙️ Worker: <span id="s-worker">Idle</span></div>
-        <div class="status-item">📊 Global Queue: <span id="s-q">0</span></div>
+        <div class="status-item">📡 SCRAPER: <span id="s-scrape">Idle</span></div>
+        <div class="status-item">⚙️ WORKER: <span id="s-worker">Idle</span></div>
+        <div class="status-item">📊 QUEUE: <span id="s-q">0</span></div>
+        <div class="status-item">🤖 TELEGRAM: <span style="color:{{ '#10b981' if telegram_enabled else '#ef4444' }}">{{ 'ON' if telegram_enabled else 'OFF' }}</span></div>
     </div>
     <div class="card">
-        <select id="mode"><option value="manual">Manual Links</option><option value="keyword">Keyword</option></select>
-        <textarea id="target" rows="3" placeholder="Links or Keyword"></textarea>
-        <button onclick="startQueue()">Add to Central Queue</button>
+        <h2>📥 Add Videos to Queue</h2>
+        <div class="input-group">
+            <div class="input-row">
+                <select id="mode">
+                    <option value="manual">Manual Links</option>
+                    <option value="keyword">Keyword</option>
+                    <option value="username">Username</option>
+                </select>
+            </div>
+            <textarea id="target" rows="3" placeholder="Keyword, username, or video links (one per line)"></textarea>
+            <button onclick="startQueue()" class="btn-orange">🚀 ADD TO QUEUE</button>
+        </div>
+        <hr>
+        <div class="input-row">
+            <button onclick="forceProcess()" style="background:#f59e0b; width: 100%;">⚡ Force Process One</button>
+        </div>
     </div>
-    <div class="card">
-        <h3>Live Logs</h3><br>
+    <div class="logs-panel">
+        <div class="logs-header"><span>📋 Live Logs (IST 12hr)</span><button onclick="clearLogs()" style="background:#475569; padding:6px 12px">Clear</button></div>
         <div id="logs">Loading...</div>
     </div>
 </div>
+<div id="toast" class="toast" style="display:none"></div>
 <script>
-    async function startQueue(){
-        let mode=document.getElementById('mode').value, input=document.getElementById('target').value;
-        await fetch('/api/repost',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,input})});
-        document.getElementById('target').value='';
-    }
-    setInterval(async()=>{
-        try{
-            let r=await fetch('/api/status'), d=await r.json();
-            document.getElementById('s-scrape').innerText=d.scraper;
-            document.getElementById('s-worker').innerText=d.worker;
-            document.getElementById('s-q').innerText=d.queue_size;
-            let logsDiv=document.getElementById('logs');
-            let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;
-            logsDiv.innerHTML=d.logs.map(l=>`<div style="color:${l.color}">[${l.time}] ${l.message}</div>`).join('');
-            if(isBottom) logsDiv.scrollTop=logsDiv.scrollHeight;
-        }catch(e){}
-    }, 1500);
+    function showToast(msg,err){let t=document.getElementById('toast');t.style.display='block';t.style.borderLeftColor=err?'#ef4444':'#10b981';t.innerHTML=msg;setTimeout(()=>t.style.display='none',3500);}
+    async function startQueue(){let mode=document.getElementById('mode').value,target=document.getElementById('target').value.trim();if(!target){showToast("Enter target!",true);return;}await fetch('/api/repost',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,input:target})});showToast("Queuing started");document.getElementById('target').value='';}
+    async function forceProcess(){await fetch('/api/force_process',{method:'POST'});showToast("Force process triggered");}
+    async function clearLogs(){await fetch('/api/clear_logs',{method:'POST'});showToast("Logs cleared");}
+    setInterval(async()=>{try{let r=await fetch('/api/status');let d=await r.json();document.getElementById('s-scrape').innerText=d.scraper;document.getElementById('s-worker').innerText=d.worker;document.getElementById('s-q').innerText=d.queue_size;let logsDiv=document.getElementById('logs');let isBottom=logsDiv.scrollHeight-logsDiv.clientHeight<=logsDiv.scrollTop+1;logsDiv.innerHTML=d.logs.map(l=>`<div><span style='color:#64748b'>[${l.time}]</span> <span style='color:${l.color}'>[${l.category}]</span> ${l.message}</div>`).join('');if(isBottom)logsDiv.scrollTop=logsDiv.scrollHeight;}catch(e){}},1500);
 </script>
 </body>
 </html>
