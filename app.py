@@ -112,11 +112,7 @@ def logout():
 # ---------------------------
 def add_to_queue(video_id, source_type, source_value):
     if not redis_client: return False
-    
-    # Use a Redis Set to ensure the exact same video ID is never queued twice
     is_new = redis_client.sadd("global_queued_ids", video_id)
-    
-    # Upstash REST returns 1 if added, 0 if already exists
     if is_new == 1 or is_new is True:
         job = {
             "id": str(uuid.uuid4()),
@@ -124,14 +120,12 @@ def add_to_queue(video_id, source_type, source_value):
             "source_type": source_type,
             "source_value": source_value
         }
-        # Push to the main queue
         redis_client.rpush("global_job_queue", json.dumps(job))
         return True
     return False
 
 def get_next_job():
     if not TELEGRAM_ENABLED or not redis_client: return None
-    # Atomically pop a job from the list.
     job_str = redis_client.lpop("global_job_queue")
     if job_str:
         job = json.loads(job_str) if isinstance(job_str, str) else job_str
@@ -234,7 +228,7 @@ def extract_video_id_from_input(input_str):
     return None
 
 # ---------------------------
-#  WORKER ENGINE
+#  WORKER ENGINE (Fully Restored Logs)
 # ---------------------------
 def worker_loop():
     if not TELEGRAM_ENABLED or not redis_client:
@@ -264,6 +258,7 @@ def process_job(job):
         encoded_id = quote(video_id, safe='')
         
         # 1. Check Duplicate via Hash
+        emit_log(f"🔍 Checking thumbnail for {video_id[:8]}...", "WORKER", "#0ea5e9")
         thumb_url = f"https://{domain}/media/images/{encoded_id}.jpg"
         thumb_resp = requests.get(thumb_url, timeout=8)
         if thumb_resp.status_code == 200:
@@ -275,6 +270,7 @@ def process_job(job):
             thumb_hash = None
 
         # 2. Fetch Meta
+        emit_log(f"📝 Fetching metadata for {video_id[:8]}...", "WORKER", "#0ea5e9")
         title = f"Video {video_id[:6]}"
         desc = ""
         try:
@@ -282,28 +278,49 @@ def process_job(job):
             vid_data = r_api[0] if isinstance(r_api, list) and len(r_api) > 0 else (r_api if isinstance(r_api, dict) else {})
             title = vid_data.get("title", title)
             desc = vid_data.get("description", desc)
-        except: pass
+            emit_log(f"📝 Title: {title[:50]}", "WORKER", "#0ea5e9")
+        except Exception as e: 
+            emit_log(f"Metadata fetch failed: {e}", "WORKER", "#ef4444", True)
 
         # 3. Download
+        emit_log(f"📥 Downloading {video_id[:8]}...", "WORKER", "#0ea5e9")
         d_url = f"https://{domain}/media/videos/{encoded_id}.mp4"
         safe_label = re.sub(r'[^a-zA-Z0-9]', '_', video_id)[-12:]
         raw_file = os.path.join(VIDEO_DIR, f"{safe_label}.mp4")
-        with requests.get(d_url, stream=True, timeout=30) as s_res:
-            s_res.raise_for_status()
-            with open(raw_file, 'wb') as f:
-                for chunk in s_res.iter_content(8192): f.write(chunk)
+        download_success = False
+        for attempt in range(1, 4):
+            try:
+                with requests.get(d_url, stream=True, timeout=30) as s_res:
+                    s_res.raise_for_status()
+                    with open(raw_file, 'wb') as f:
+                        for chunk in s_res.iter_content(8192): f.write(chunk)
+                download_success = True
+                break
+            except Exception as e:
+                emit_log(f"⚠️ Download error (attempt {attempt}/3): {e}", "WORKER", "#f59e0b")
+                time.sleep(2 ** attempt)
+                
+        if not download_success:
+            raise Exception("Download failed")
+            
+        emit_log(f"✅ Downloaded {raw_file}", "WORKER", "#10b981")
         
         # 4. Telegram
+        emit_log(f"📤 Sending to Telegram...", "WORKER", "#0ea5e9")
         caption = f"{title}\n\n{desc}" if desc else title
         if send_video_to_telegram(raw_file, caption):
-            emit_log(f"✅ Sent: {video_id[:8]}", "WORKER", "#10b981")
+            emit_log(f"✅ Sent to Telegram: {video_id[:8]}", "WORKER", "#10b981")
             mark_sent(thumb_hash)
+        else:
+            raise Exception("Telegram send failed")
             
     except Exception as e:
-        emit_log(f"🔥 Error: {e}", "WORKER", "#ef4444")
+        emit_log(f"🔥 Error processing {video_id}: {e}", "WORKER", "#ef4444", True)
     finally:
         if raw_file and os.path.exists(raw_file):
-            try: os.remove(raw_file)
+            try: 
+                os.remove(raw_file)
+                emit_log(f"🗑️ Deleted temp file", "WORKER", "#64748b")
             except: pass
 
 # ---------------------------
