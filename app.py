@@ -28,6 +28,17 @@ TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID', '-1003810911847')
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 
 # ---------------------------
+#  RENDER KEEP-ALIVE SERVERS
+# ---------------------------
+RENDER_SERVERS = [
+    "https://reposterrr0.onrender.com",
+    "https://reposterrr1.onrender.com",
+    "https://reposterrr2.onrender.com",
+    "https://reposterrr3.onrender.com",
+    "https://reposterrr4.onrender.com"
+]
+
+# ---------------------------
 #  HARDCODED UPSTASH REDIS REST CREDENTIALS
 # ---------------------------
 UPSTASH_REDIS_REST_URL = "https://top-grackle-133613.upstash.io"
@@ -228,7 +239,7 @@ def extract_video_id_from_input(input_str):
     return None
 
 # ---------------------------
-#  WORKER ENGINE (Fully Restored Logs)
+#  WORKER ENGINE
 # ---------------------------
 def worker_loop():
     if not TELEGRAM_ENABLED or not redis_client:
@@ -324,8 +335,34 @@ def process_job(job):
             except: pass
 
 # ---------------------------
+#  KEEP ALIVE PINGER
+# ---------------------------
+def keep_alive_pinger():
+    """Continuously pings all Render servers in the list every 5 minutes to keep them awake."""
+    while True:
+        # 300 seconds = 5 minutes. Render sleeps after 15 minutes of inactivity.
+        time.sleep(300)
+        for server_url in RENDER_SERVERS:
+            try:
+                url = f"{server_url.rstrip('/')}/health"
+                # Short timeout so it doesn't hang the thread if a server is entirely down
+                requests.get(url, timeout=10) 
+            except Exception:
+                pass # Silently fail to avoid polluting the worker logs
+
+# ---------------------------
 #  FLASK ROUTES
 # ---------------------------
+
+# NEW HEALTH CHECK ENDPOINT
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "alive",
+        "server_id": SERVER_ID,
+        "time": ist_time_str()
+    }), 200
+
 @app.route('/')
 @login_required
 def home():
@@ -469,7 +506,9 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# START BACKGROUND THREADS
 threading.Thread(target=worker_loop, daemon=True).start()
+threading.Thread(target=keep_alive_pinger, daemon=True).start() # Starts the pinger loop
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
