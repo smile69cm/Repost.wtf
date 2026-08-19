@@ -1,10 +1,9 @@
-import os, json, time, requests, threading, re, urllib.parse, hashlib, traceback, fcntl, sys, uuid, socket, random
+import os, json, time, requests, threading, re, urllib.parse, hashlib, traceback, sys, uuid, socket, random
 import asyncio, aiohttp
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from functools import wraps
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
-from upstash_redis import Redis
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'changeme_production_secret_!@#$')
@@ -39,12 +38,6 @@ RENDER_SERVERS = [
 ]
 
 # ---------------------------
-#  HARDCODED UPSTASH REDIS REST CREDENTIALS
-# ---------------------------
-UPSTASH_REDIS_REST_URL = "https://top-grackle-133613.upstash.io"
-UPSTASH_REDIS_REST_TOKEN = "gQAAAAAAAgntAAIgcDI4NWRmYmNkYThmMzA0ZDI5YjY0OWM2N2IyYWRiN2IxOA"
-
-# ---------------------------
 #  DIRECTORIES & FILES
 # ---------------------------
 BASE_DIR = os.getcwd()
@@ -53,15 +46,49 @@ STATE_FILE = "state.json"
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # ---------------------------
-#  UPSTASH REDIS CONNECTION
+#  IN-MEMORY QUEUE (Thread‑safe)
 # ---------------------------
-try:
-    redis_client = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-    redis_client.ping()
-    print("✅ Connected to Central Redis Queue (Upstash REST)")
-except Exception as e:
-    print(f"❌ Redis connection failed: {e}")
-    redis_client = None
+queue_lock = threading.Lock()
+queued_ids = set()      # to prevent duplicates
+job_queue = []          # list of job dicts
+sent_hashes = set()     # to avoid re‑sending identical thumbnails
+
+def add_to_queue(video_id, source_type, source_value):
+    """Add a video to the local queue if not already present."""
+    with queue_lock:
+        if video_id in queued_ids:
+            return False
+        queued_ids.add(video_id)
+        job = {
+            "id": str(uuid.uuid4()),
+            "video_id": video_id,
+            "source_type": source_type,
+            "source_value": source_value
+        }
+        job_queue.append(job)
+        return True
+
+def get_next_job():
+    """Pop the next job from the local queue (FIFO)."""
+    with queue_lock:
+        if not job_queue:
+            return None
+        return job_queue.pop(0)   # FIFO
+
+def get_queue_size():
+    with queue_lock:
+        return len(job_queue)
+
+def is_already_sent(thumbnail_hash):
+    if not thumbnail_hash:
+        return False
+    with queue_lock:
+        return thumbnail_hash in sent_hashes
+
+def mark_sent(thumbnail_hash):
+    if thumbnail_hash:
+        with queue_lock:
+            sent_hashes.add(thumbnail_hash)
 
 # ---------------------------
 #  LOCAL STATE (For UI Logs)
@@ -117,45 +144,6 @@ def login():
 def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
-
-# ---------------------------
-#  CENTRALIZED QUEUE HELPERS (REDIS)
-# ---------------------------
-def add_to_queue(video_id, source_type, source_value):
-    if not redis_client: return False
-    is_new = redis_client.sadd("global_queued_ids", video_id)
-    if is_new == 1 or is_new is True:
-        job = {
-            "id": str(uuid.uuid4()),
-            "video_id": video_id,
-            "source_type": source_type,
-            "source_value": source_value
-        }
-        redis_client.rpush("global_job_queue", json.dumps(job))
-        return True
-    return False
-
-def get_next_job():
-    if not TELEGRAM_ENABLED or not redis_client: return None
-    job_str = redis_client.lpop("global_job_queue")
-    if job_str:
-        job = json.loads(job_str) if isinstance(job_str, str) else job_str
-        emit_log(f"🎯 Got job: {job['video_id'][:8]}", "WORKER", "#f59e0b")
-        return job
-    return None
-
-def get_queue_size():
-    if not redis_client: return 0
-    return redis_client.llen("global_job_queue") or 0
-
-def is_already_sent(thumbnail_hash):
-    if not thumbnail_hash or not redis_client: return False
-    result = redis_client.sismember("global_sent_hashes", thumbnail_hash)
-    return result == 1 or result is True
-
-def mark_sent(thumbnail_hash):
-    if redis_client and thumbnail_hash:
-        redis_client.sadd("global_sent_hashes", thumbnail_hash)
 
 # ---------------------------
 #  TELEGRAM SENDER
@@ -242,8 +230,8 @@ def extract_video_id_from_input(input_str):
 #  WORKER ENGINE
 # ---------------------------
 def worker_loop():
-    if not TELEGRAM_ENABLED or not redis_client:
-        emit_log("⚠️ Missing Telegram Token or Redis connection – worker idle.", "WORKER", "#f59e0b")
+    if not TELEGRAM_ENABLED:
+        emit_log("⚠️ Telegram not configured – worker idle.", "WORKER", "#f59e0b")
         while True: time.sleep(60)
         
     emit_log(f"👷 Worker online (Server: {SERVER_ID})", "WORKER", "#f59e0b")
@@ -340,21 +328,17 @@ def process_job(job):
 def keep_alive_pinger():
     """Continuously pings all Render servers in the list every 5 minutes to keep them awake."""
     while True:
-        # 300 seconds = 5 minutes. Render sleeps after 15 minutes of inactivity.
         time.sleep(300)
         for server_url in RENDER_SERVERS:
             try:
                 url = f"{server_url.rstrip('/')}/health"
-                # Short timeout so it doesn't hang the thread if a server is entirely down
                 requests.get(url, timeout=10) 
             except Exception:
-                pass # Silently fail to avoid polluting the worker logs
+                pass
 
 # ---------------------------
 #  FLASK ROUTES
 # ---------------------------
-
-# NEW HEALTH CHECK ENDPOINT
 @app.route('/health')
 def health_check():
     return jsonify({
@@ -396,14 +380,14 @@ def api_repost():
             ids = [extract_video_id_from_input(l) for l in target.replace(',', '\n').split('\n') if l.strip()]
             ids = [vid for vid in ids if vid]
             added = sum(1 for vid in ids if add_to_queue(vid, "manual", "user_input"))
-            emit_log(f"Manual: queued {added} new videos to Redis", "QUEUE", "#f59e0b")
+            emit_log(f"Manual: queued {added} new videos to local queue", "QUEUE", "#f59e0b")
         else:
             update_status(scraper=f"Scraping {mode} '{target}'...")
             emit_log(f"Scraping {mode} '{target}'...", "SCRAPE", "#3b82f6")
             scraped_ids = run_coroutine(async_scrape_ids(mode, target))
             if scraped_ids:
                 added = sum(1 for vid in scraped_ids if add_to_queue(vid, mode, target))
-                emit_log(f"Queued {added} new videos to Redis", "SCRAPE", "#3b82f6")
+                emit_log(f"Queued {added} new videos to local queue", "SCRAPE", "#3b82f6")
             else:
                 emit_log(f"No IDs found", "SCRAPE", "#ef4444")
             update_status(scraper="Idle")
@@ -418,7 +402,7 @@ def force_process():
     return jsonify({"status": "forced"})
 
 # ---------------------------
-#  UI TEMPLATES
+#  UI TEMPLATES (unchanged)
 # ---------------------------
 LOGIN_TEMPLATE = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Telegram Swarm Login</title><style>
@@ -508,7 +492,7 @@ HTML_TEMPLATE = """
 
 # START BACKGROUND THREADS
 threading.Thread(target=worker_loop, daemon=True).start()
-threading.Thread(target=keep_alive_pinger, daemon=True).start() # Starts the pinger loop
+threading.Thread(target=keep_alive_pinger, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5050))
